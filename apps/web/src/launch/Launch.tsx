@@ -1,4 +1,4 @@
-// The launch video, one 1280 × 720 frame. It opens and ends on the hero's sea; between, a
+// The launch video, one 1280 × 720 frame. It opens on the hero's sea and ends signed on plain blue; between, a
 // desktop on plain blue: a menu bar, t3boat's popover on its mock backend and T3 Code's window,
 // a camera that frames what is happening, the site's red arrow at what to watch, and a band
 // below that says what it is. scripts/launch.ts moves the camera, arrow and cursor, and clicks.
@@ -11,10 +11,10 @@ import { Hero } from "../Hero";
 import { AppleMark, BoatLogo, LinuxMark, T3CodeMark, WindowsMark } from "../logos";
 import { NO_PICK, sendTurn, Thread, type Picker, type Stage } from "../Thread";
 
-/** open: the hero. desk: the popover alone. chat: T3 Code next to it. end: the hero, signed. */
+/** open: the hero. desk: the popover alone. chat: T3 Code next to it. end: t3boat, signed, on plain blue. */
 export type Scene = "open" | "desk" | "chat" | "end";
 /** The one machine: made in the popover, then picked in T3 Code. */
-export const MACHINE = "jukebox";
+export const MACHINE = "beebox";
 
 /** What the band says: the window to watch, the line, and whether time runs fast. */
 export interface Line {
@@ -36,7 +36,7 @@ export interface LaunchHandle {
   /** the red arrow's tip, on the desktop; hidden when `shown` is false */
   arrow(x: number, y: number, shown: boolean): void;
   /** time flies for the idle machine until it sleeps */
-  later(): Promise<void>;
+  later(): void;
 }
 
 declare global {
@@ -86,8 +86,8 @@ export function Launch() {
         arrow.current!.style.transform = `translate(${x}px, ${y}px)`;
         arrow.current!.classList.toggle("is-shown", shown);
       },
-      later: async () => {
-        if (mock && home) await mock.later(home.id, 3000);
+      later() {
+        if (mock && home) mock.later(home.id, 3000);
       },
     };
   });
@@ -171,7 +171,7 @@ export function Launch() {
 
       <div className="endcard">
         <div className="endcard-mark">
-          <img src={icon} alt="" width={88} height={88} />
+          <img src={icon} alt="" width={112} height={112} />
           t3boat
         </div>
         <p className="endcard-line">Free and open source</p>
@@ -181,6 +181,7 @@ export function Launch() {
           <LinuxMark aria-hidden />
         </p>
         <p className="endcard-url">t3boat.paukraft.com</p>
+        <p className="endcard-note">Not affiliated with or endorsed by T3 Code or Boat.</p>
       </div>
     </div>
   );

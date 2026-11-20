@@ -234,10 +234,13 @@ body {
 }
 
 .endcard {
-  inset: 104px 0 auto;
+  --note: 44px;
+  inset: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
+  padding-bottom: var(--note);
   color: #fff;
   opacity: 0;
   transform: translateY(20px);
@@ -248,9 +251,6 @@ body {
   gap: 22px;
   font: 600 112px/1 var(--font-display);
   letter-spacing: -0.03em;
-}
-.endcard-mark img {
-  box-shadow: 8px 8px 0 var(--shade);
 }
 .endcard-line {
   margin-top: 28px;
@@ -274,11 +274,23 @@ body {
   font: 500 22px/1 var(--font-mono);
   box-shadow: 6px 6px 0 var(--shade);
 }
+/* the notice, on a strip like the band's along the bottom */
+.endcard-note {
+  position: absolute;
+  inset: auto 0 0;
+  display: grid;
+  place-items: center;
+  height: var(--note);
+  background: var(--wash);
+  color: var(--ink);
+  box-shadow: 0 -1px 0 var(--shade);
+  font: 400 15px/1 var(--font-body);
+}
 
 /* the scenes */
 .launch:is([data-scene="desk"], [data-scene="chat"]) :is(.desk, .menubar, .win-app, .band),
 .launch[data-scene="chat"] .win-t3,
-.launch[data-scene="end"] .endcard {
+.launch[data-scene="end"] :is(.desk, .endcard) {
   opacity: 1;
   transform: none;
 }

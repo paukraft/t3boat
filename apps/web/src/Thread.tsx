@@ -49,7 +49,7 @@ interface Frame {
 export type Stage = "unsent" | "waking" | "working" | "idle";
 
 /** How long a message takes to wake a sleeping machine: long enough to read that it does. */
-export const WAKE_MS = 3500;
+const WAKE_MS = 3500;
 /** How long the agent works on it: its steps, its reply, and a moment to read that. */
 export const WORK_MS = 7500;
 

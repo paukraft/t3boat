@@ -7,7 +7,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { MACHINE, type Line, type Scene } from "../src/launch/Launch";
-import { WAKE_MS, WORK_MS, type Picker } from "../src/Thread";
+import { WORK_MS, type Picker } from "../src/Thread";
 
 const URL = new globalThis.URL("launch.html", process.env.SITE ?? "http://localhost:5173/").href;
 const OUT = resolve(process.argv[2] ?? "launch.mp4");
@@ -156,6 +156,10 @@ async function point(to: (() => Promise<Pt>) | null) {
 async function click(to: () => Promise<Pt>, then?: () => Promise<unknown>) {
   await go(1, { cursor: await to() });
   await hold(0.25);
+  await press(then);
+}
+/** A click where the cursor is. */
+async function press(then?: () => Promise<unknown>) {
   pressed = true;
   await frame();
   if (!then) await page.mouse.down();
@@ -178,22 +182,27 @@ async function type(text: string) {
 const scene = (s: Scene) => page.evaluate((s) => window.launch!.scene(s), s);
 const say = (line: Line | null) => page.evaluate((line) => window.launch!.say(line), line);
 
-// the arrow's spots: under the machine's status line in the popover, at T3 Code's newest message
+// the arrow's spot: under the machine's status line in the popover
 const status = spot(popover, ".row-detail", 0.3, 1.1);
-const newest = spot(t3, ".messages-timeline-row-frame:nth-last-child(2)", 0.14, 0.95);
 /** the mock's creation steps, 1.8s each: the last asks T3 Code to add it, agents signed in */
 const ADDING = 3 * 1800;
 const CREATED = 4 * 1800;
+/** later(): the countdown runs out over 3s, then the mock's sleep step */
 const TO_SLEEP = 3000 + 1800 + 300;
 
 // ── the timeline ──────────────────────────────────────
-await hold(3);
+await hold(1.5);
 
 // the menu bar and t3boat's popover: the machine
 await scene("desk");
 await say({ look: "t3boat", text: "Create a machine from the menu bar." });
 await go(1.4, { cam: framing(POPOVER) });
-await click(spot(popover, "button:has-text('New machine')", 0.45, 0.6));
+// the form suggests a name: cleared before it is seen, so the name is typed into an empty field
+await click(spot(popover, "button:has-text('New machine')", 0.45, 0.6), async () => {
+  await page.mouse.down();
+  await page.mouse.up();
+  await popover.locator("#machine-name").fill("");
+});
 await hold(0.8);
 await type(MACHINE);
 await hold(0.6);
@@ -201,54 +210,40 @@ await click(spot(popover, "button:has-text('Launch machine')", 0.5, 0.6));
 const launched = clockMs;
 await go(0.8, { cursor: AWAY });
 await say({ look: "t3boat", text: "It's ready in about a minute.", fast: true });
-await point(status);
 await until(launched + ADDING + 300, 2.2);
 await say({ look: "t3boat", text: "t3boat adds it to T3 Code for you." });
-await until(launched + CREATED + 300, 2.2);
-await hold(2);
-await say({ look: "t3boat", text: "Until you use it, it sleeps. Asleep, it costs nothing.", fast: true });
-const unused = clockMs;
-await page.evaluate(() => void window.launch!.later());
-await until(unused + TO_SLEEP, 1.6);
-await hold(1.2);
-await point(null);
+await until(launched + CREATED, 2.2);
+await hold(0.4);
 
-// T3 Code next to it: pick the machine, send, it wakes
+// T3 Code next to it: pick the machine, send, the agent works there
 await scene("chat");
 await say({ look: "T3 Code", text: "In T3 Code, pick the machine." });
-await go(1.4, { cam: FULL });
-await hold(0.6);
 await go(1.2, { cam: COMPOSER });
 const trigger = spot(t3, '[data-mock="machine-selector"]', 0.5, 0.6);
 await click(trigger, () => pick({ menuOpen: true, hovered: true }));
-await hold(0.5);
-await go(0.7, { cursor: await spot(t3, `[data-mock="machine-option:${MACHINE}"]`, 0.4, 0.55)() });
+await hold(0.2);
+await go(0.5, { cursor: await spot(t3, `[data-mock="machine-option:${MACHINE}"]`, 0.4, 0.55)() });
 await pick({ highlightedId: MACHINE });
-await click(spot(t3, `[data-mock="machine-option:${MACHINE}"]`, 0.4, 0.55), () =>
-  pick({ selectedId: MACHINE, menuOpen: false, highlightedId: null, hovered: false }),
-);
+await hold(0.15);
+await press(() => pick({ selectedId: MACHINE, menuOpen: false, highlightedId: null, hovered: false }));
 await hold(0.8);
 await say({ look: "T3 Code", text: "Then chat as usual." });
 await click(spot(t3, 'button[type="submit"]'));
 const sent = clockMs;
-await say({ look: "t3boat", text: "Your message wakes the machine. That takes seconds." });
+await say({ look: "T3 Code", text: `The agent works on ${MACHINE}. Close your laptop, it keeps going.`, fast: true });
 await go(1.2, { cam: FULL, cursor: AWAY });
+await until(sent + WORK_MS, 1.8);
+await say({ look: "T3 Code", text: `Done, on ${MACHINE}. Your laptop only showed the chat.` });
+await hold(2.4);
+await say({ look: "t3boat", text: "Idle for a bit, it goes back to sleep.", fast: true });
+await go(1.2, { cam: framing(POPOVER) });
 await point(status);
-await until(sent + WAKE_MS);
-
-// the agent works on it, then it idles and goes back to sleep
-await say({ look: "T3 Code", text: "The agent works on the machine, laptop lid open or closed." });
-await point(newest);
-await until(sent + WAKE_MS + WORK_MS);
-await hold(1.6);
-await say({ look: "t3boat", text: "Done. If the machine is idle for a bit, it goes back to sleep.", fast: true });
-await point(status);
-await hold(1.2);
-const later = clockMs;
-await page.evaluate(() => void window.launch!.later());
-await until(later + TO_SLEEP);
+await hold(0.4);
+const idle = clockMs;
+await page.evaluate(() => window.launch!.later());
+await until(idle + TO_SLEEP, 1.6);
 await say({ look: "t3boat", text: "Asleep, it costs nothing until your next message." });
-await hold(2.6);
+await hold(2.4);
 
 await point(null);
 await scene("end");
