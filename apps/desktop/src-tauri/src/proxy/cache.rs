@@ -16,7 +16,7 @@ const MAX_UNARY: usize = 300;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Capture {
-    /// Unix ms when captured, then when the watchdog confirmed stopping at it.
+    /// Unix ms when captured, then when the watchdog accepted its ack or was seen stopping at it.
     pub at: i64,
     /// `latestApplicationSequence`: the shell cursor of a client that missed nothing.
     pub sequence: u64,

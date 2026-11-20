@@ -81,7 +81,7 @@ export function NewMachine({ state, onNameChange, onCreate, onBack }: Props) {
             ))}
           </div>
           <span className="hint">
-            Billed only while awake · sleeps 5 min after agents finish · resize anytime
+            Billed only while awake · sleeps 3 min after agents finish · resize anytime
           </span>
         </fieldset>
 

@@ -55,6 +55,11 @@ impl T3Desktop {
             .map(|cli| Self { cli, token_file: None, token: Arc::default() })
     }
 
+    #[cfg(test)]
+    pub fn at(cli: PathBuf) -> Self {
+        Self { cli, token_file: None, token: Arc::default() }
+    }
+
     pub fn with_token_file(mut self, path: PathBuf) -> Self {
         self.token = Arc::new(std::fs::read_to_string(&path).ok().map(|t| t.trim().to_owned()).into());
         self.token_file = Some(path);

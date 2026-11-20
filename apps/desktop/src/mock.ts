@@ -9,7 +9,7 @@ import type { CommandArgs, CommandName, LocalProject, MachineDetails, MachinePro
 
 const params = new URLSearchParams(location.search);
 
-type Seed = Omit<MachineView, "countdown" | "signedOut" | "projects" | "keepAwakeUntil" | "keepAwakeForever"> &
+type Seed = Omit<MachineView, "countdown" | "signedOut" | "projects" | "keepAwakeUntil" | "keepAwakeForever" | "waiting"> &
   Partial<Pick<MachineView, "countdown" | "signedOut" | "projects">>;
 const machine = (m: Seed): MachineView => ({
   countdown: null,
@@ -17,6 +17,7 @@ const machine = (m: Seed): MachineView => ({
   projects: [],
   keepAwakeUntil: null,
   keepAwakeForever: false,
+  waiting: false,
   ...m,
 });
 
@@ -30,8 +31,8 @@ const LOCAL_PROJECTS: LocalProject[] = [
   { id: "p4", title: "dotfiles", path: "/Users/you/dotfiles", repoKey: "github.com/you/dotfiles", icon: null },
 ];
 
-/** An idle machine's detail: sleeps 5 minutes from now. */
-const idle = () => ({ detail: "Idle · sleeps in 5m", countdown: { template: "Idle · sleeps in {left}", endsAt: Date.now() + 5 * 60_000 } });
+/** An idle machine's detail: sleeps 3 minutes from now. */
+const idle = () => ({ detail: "Idle · sleeps in 3m", countdown: { template: "Idle · sleeps in {left}", endsAt: Date.now() + 3 * 60_000 } });
 
 const WAKING = { state: "waking", detail: "Waking up…", countdown: null } as const;
 

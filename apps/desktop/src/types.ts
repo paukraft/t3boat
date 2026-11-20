@@ -25,6 +25,7 @@ export interface MachineView {
   projects: MachineProject[]; // its T3 projects as last seen (never wakes it), then those being added
   keepAwakeUntil: number | null; // when a "keep awake" runs out (unix ms); null when off or until stopped
   keepAwakeForever: boolean; // kept awake until someone stops it: no auto sleep
+  waiting: boolean; // an agent there waits on the user: a resize waits for the next sleep
 }
 
 export interface MachineProject {

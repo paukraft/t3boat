@@ -137,8 +137,8 @@ export function powerAction(m: MachineView): Action | null {
 /** When a resize takes effect, per contract. */
 export function resizeHint(m: MachineView): string {
   if (m.state === "asleep") return "Applies on next wake";
-  if (m.state === "working") return "Applies after it next sleeps, never mid-turn";
-  if (m.state === "idle") return "Restarts onto the new size now (about a minute)";
+  if (m.state === "working" || m.waiting) return "Applies after it next sleeps, never mid-turn";
+  if (m.state === "idle") return "Restarts onto the new size now";
   return "Billed only while awake";
 }
 

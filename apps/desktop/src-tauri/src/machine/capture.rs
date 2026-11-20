@@ -12,19 +12,20 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-/// Second check on a confirmed capture: Boat's stop time must follow it closely (allowing for
-/// clock skew between this computer and Boat).
-/// The watchdog stops right after the ack and gives up on a stop after 90 s.
+/// Second check on a confirmed capture: Boat's stop time must follow the confirmation closely
+/// (allowing for clock skew between this computer and Boat).
+/// The watchdog stops on its next tick after an accepted ack (5 s), after its usual checks, and
+/// gives up on a stop after 90 s. Any later stop at that sequence comes too late.
 const CAPTURE_TO_STOP_MAX: chrono::TimeDelta = chrono::TimeDelta::minutes(2);
-/// Time for a capture, shell and chats. The watchdog stops 20 s into a drain, acked or not,
-/// and this app may learn of the drain 5 s late.
+/// Time for a capture, shell and chats. The watchdog waits 45 s into a drain for the ack before
+/// saving the snapshot itself, awake, and this app may learn of the drain 5 s late.
 const CAPTURE_BUDGET: Duration = Duration::from_secs(12);
 const THREAD_FETCHES: usize = 4;
 const CLOCK_SKEW: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
 
 impl MachineRuntime {
-    /// The capture stands in for the server only if the watchdog confirmed stopping at its
-    /// sequence and nothing ran since.
+    /// The capture stands in for the server only if it was confirmed, by an accepted ack or by
+    /// seeing the watchdog stopping at its sequence, and the stop followed closely.
     pub fn fresh_capture(&self) -> Option<Capture> {
         if self.power() != Power::Stopped {
             return None;
@@ -45,10 +46,11 @@ impl MachineRuntime {
         self.cache.lock().unwrap().capture.as_ref().map(|c| c.sequence)
     }
 
-    pub(super) fn confirm_capture(&self) {
+    /// Confirmed by an accepted ack or by seeing the watchdog stopping at its sequence. Dated
+    /// again by each: the stop follows the last of them, and a drain can stall between them.
+    pub(super) fn confirm_capture(&self, sequence: u64) {
         let changed = match self.cache.lock().unwrap().capture.as_mut() {
-            Some(c) if !c.confirmed => {
-                // The stop follows the confirmation, not the capture: a drain can stall between them.
+            Some(c) if c.sequence == sequence => {
                 c.confirmed = true;
                 c.at = chrono::Utc::now().timestamp_millis();
                 true

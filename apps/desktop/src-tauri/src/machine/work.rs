@@ -17,7 +17,8 @@ impl MachineRuntime {
     }
 
     /// Fails while an agent or a build works on the machine, or while that can't be told yet. An
-    /// asleep machine has nothing running, so it isn't woken just to ask.
+    /// agent waiting on the user is not work: nothing runs until they answer. An asleep machine has
+    /// nothing running, so it isn't woken just to ask.
     pub async fn check_idle_before_delete(&self) -> Result<()> {
         match self.settled_power().await {
             Power::Stopped | Power::Missing => Ok(()),

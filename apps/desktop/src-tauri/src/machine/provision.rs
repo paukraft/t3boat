@@ -51,16 +51,16 @@ pub fn size(id: &str) -> Result<&'static SizeInfo> {
 }
 
 /// How long a machine stays up after the last agent turn and the last action through t3boat.
-/// Long enough to read a result and type a follow-up without waiting for a wake; idle minutes
-/// cost under a cent even on the large size.
-pub const SLEEP_AFTER_SECS: u64 = 300;
+/// Long enough to read a result and type a follow-up without waiting for a wake; a wake soon
+/// after is quick, as Boat usually keeps the stopped VM about 10 minutes.
+pub const SLEEP_AFTER_SECS: u64 = 180;
 
 /// The machine's sandbox, as Boat lists it.
 pub fn sandbox_name(name: &str) -> String {
     format!("t3boat · {name}")
 }
 
-/// The saved snapshot the watchdog replaces at every sleep. Boat deletes a stopped sandbox's
+/// The saved snapshot replaced at every sleep. Boat deletes a stopped sandbox's
 /// disk after 14 days; this stays, so the machine can be restored from it. Unique per machine,
 /// whoever else uses the Boat account. Boat takes lowercase letters, digits and dashes.
 pub fn snapshot_name(name: &str, machine_id: &str) -> String {
@@ -166,5 +166,6 @@ pub async fn create(
         created_at: chrono::Utc::now().timestamp(),
         next_due_at: None,
         connect: false,
+        saved_stop: None,
     })
 }

@@ -2,12 +2,16 @@
 // agent works and nobody used it for `sleepAfterSecs`. It lives here, not on the laptop, so
 // machines finish their work and then sleep even when the laptop is closed.
 //
-// Going to sleep, it first saves the disk as a Boat snapshot: Boat deletes a stopped sandbox's
-// disk after 14 days, the saved snapshot stays, and t3boat restores the machine from it.
-//
-// Then it "drains": it publishes a manifest of the final orchestration state so the laptop
+// To sleep it "drains": it publishes a manifest of the final orchestration state so the laptop
 // proxy can keep answering T3 Code truthfully while the machine sleeps. The proxy captures it
-// and acks; without an ack (laptop gone) the watchdog stops after a grace period.
+// and acks, and the watchdog stops on its next tick, after its usual checks.
+//
+// The disk is saved as a Boat snapshot at every sleep: Boat deletes a stopped sandbox's disk
+// after 14 days, the saved snapshot stays, and t3boat restores the machine from it. An ack hands
+// the save to the laptop app, which makes it from the stopped sandbox and bills nothing. Without
+// one by the end of a grace period (laptop gone, its capture failed) the watchdog saves it
+// first, awake, then stops on a later tick. Only one save of its own runs at a time, and none
+// stops the machine while it runs: one called off by use runs on, and could finish after the app's.
 
 import { createServer } from "node:http";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -25,25 +29,32 @@ const DB_PATH = join(HOME, ".t3", "userdata", "statev2.sqlite");
 const T3_ORIGIN = "http://127.0.0.1:3773";
 const PORT = 3774;
 const TICK_MS = 5_000;
-const DRAIN_GRACE_MS = 20_000;
+// The app's ack can take a poll, a capture of up to 12 s and the post. A miss costs a ~2 min save
+// while awake.
+const DRAIN_GRACE_MS = 45_000;
 // A tick that arrives this late means the VM was frozen: a warm resume after a stop.
 const RESUMED_GAP_MS = 30_000;
 // Still running this long after asking Boat to stop: the stop failed or a fast resume undid it.
 const STOP_SETTLE_MS = 90_000;
-// A save takes about 30 s. One that hangs must not keep the machine up.
-const SNAPSHOT_TIMEOUT_MS = 120_000;
+// A save makes a fresh capture of the disk: about 2 min on a new small machine, more with a
+// fuller disk. One that hangs must not keep the machine up.
+const SNAPSHOT_TIMEOUT_MS = 10 * 60_000;
 
 const config = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 
-/** @type {"active" | "saving" | "draining" | "stopping"} */
+/**
+ * draining: the manifest is published, waiting for the app's ack or the grace period. saving: this
+ * watchdog saves the snapshot after an unacked drain, manifest still published.
+ * @type {"active" | "draining" | "saving" | "stopping"}
+ */
 let phase = "active";
 /** Last time anything held the machine up, CPU load included: the idle countdown starts here. */
 let lastActivityAt = Date.now();
 /** Last time an agent, the user or a keep-awake held it up: CPU load holds it only so long after. */
 let lastUsedAt = Date.now();
-/** Agent runs in flight: top-level threads and subagents. */
-let working = { threads: 0, subagents: 0 };
+/** Agent runs in flight (top-level threads and subagents), and runs waiting on a person. */
+let working = { threads: 0, subagents: 0, waiting: 0 };
 // T3 not answering: an agent might be mid-turn, so count it as working, but only this long, so a
 // broken server cannot keep the machine billing.
 const UNKNOWN_BUSY_MS = 30 * 60_000;
@@ -65,7 +76,7 @@ async function refreshWorking() {
     unknownSince = 0;
     t3Answered = true;
   } catch (e) {
-    working = { threads: 0, subagents: 0 };
+    working = { threads: 0, subagents: 0, waiting: 0 };
     if (t3Answered) unknownSince ||= Date.now();
     log(e.message);
   }
@@ -103,8 +114,14 @@ function sampleCpu() {
 }
 let manifest = null;
 let drainStartedAt = 0;
-/** Counts the saves begun: one called off and begun again must not finish for the later one. */
-let saves = 0;
+/**
+ * This sleep's snapshot is seen to: the laptop app acked the drain (it saves the snapshot once
+ * the machine has stopped), or this watchdog saved it. The next tick that finds the machine idle
+ * stops it. Only hold() clears it.
+ */
+let snapshotCovered = false;
+/** A `boat snapshot self` this watchdog started still runs, whether or not its sleep was called off. */
+let saveRunning = false;
 let lastTickAt = Date.now();
 let stopRequestedAt = 0;
 /** "Keep awake": no sleeping before this (ms since epoch), working or not; Infinity = until stopped. */
@@ -206,25 +223,138 @@ function readT3State() {
 }
 
 const LIVE_STATUSES = new Set(["queued", "preparing", "starting", "running", "waiting"]);
+/** Request kinds T3 settles itself: nobody is waited on. */
+const SELF_SETTLED = ["auth_refresh", "dynamic_tool_call"];
 
-/** Any agent run in flight, including one waiting on an approval: stopping would kill it. */
+/**
+ * The run stopped at a prompt only a person answers: an approval, or a question it can't go on
+ * past. T3 marks the other questions `blocking: false`: the run works past them, or (left after a
+ * restart) T3 takes the answer as a message. It does not hold the machine: nobody should pay while
+ * it waits. A question survives the sleep; an approval survives a warm resume, after a cold one T3
+ * expires it and the user sends a message to go on.
+ */
+function waitsOnPerson(thread) {
+  const request = thread.pendingRuntimeRequest;
+  if (request == null || request.blocking === false) return false;
+  if (SELF_SETTLED.includes(request.kind)) return false;
+  // A secret or a link card. The shell can't tell them apart, and a link card's agent works on.
+  if (request.userOnly) return false;
+  // A delegated child's question goes to the agent that delegated it, here or on another machine.
+  const delegated = thread.lineage?.relationshipToParent === "subagent" || thread.delegatedFrom != null;
+  return !(delegated && request.kind === "user_input");
+}
+
+/**
+ * The threads among `waiting` whose run works on beside the prompt: anything T3 counts as
+ * background work, less the tools a pending prompt holds up. That is a command, a tool or a
+ * subagent still running in any run but a rolled-back one, less a persistent tool (it never
+ * ends), and the tasks in the provider thread's roster (Claude's background commands). T3 lists
+ * none of it while a run is active, so this reads its database. A prompt holds up the tool its
+ * approval hangs under (Claude, Codex) or, in ACP, the one in its provider turn it shares a
+ * native id with. OpenCode and Pi tie theirs to no tool, so it works on. A subagent always
+ * counts: the prompt may be its own, while its parent works on. T3 shows a thread's prompt from
+ * any run, and Pi asks outside one: a prompt not in the active run stops nothing, so that run
+ * works on. Unreadable: all of them work, so none is cut off.
+ */
+function workingBesidePrompt(waiting, ownWork) {
+  if (waiting.size === 0) return new Set();
+  try {
+    const db = new DatabaseSync(DB_PATH, { readOnly: true });
+    try {
+      const rows = db
+        .prepare(
+          `WITH waiting(thread_id, provider_thread_id, run_id, request_id) AS (
+             SELECT json_extract(value, '$.id'), json_extract(value, '$.activeProviderThreadId'),
+               json_extract(value, '$.activeRunId'), json_extract(value, '$.requestId')
+             FROM json_each(?)
+           )
+           SELECT waiting.thread_id AS threadId, item.type AS kind,
+             json_extract(item.payload_json, '$.childThreadId') AS childThreadId
+           FROM waiting
+           JOIN orchestration_v2_projection_turn_items AS item ON item.thread_id = waiting.thread_id
+           LEFT JOIN orchestration_v2_projection_runs AS run ON run.run_id = item.run_id
+           WHERE item.type IN ('command_execution', 'dynamic_tool', 'subagent')
+             AND item.status IN ('pending', 'running', 'waiting')
+             AND run.status IS NOT 'rolled_back'
+             AND json_extract(item.payload_json, '$.input.persistent') IS NOT 1
+             AND (item.type = 'subagent' OR NOT EXISTS (
+               SELECT 1 FROM orchestration_v2_projection_runtime_requests AS request
+               JOIN orchestration_v2_projection_nodes AS gate ON gate.node_id = request.node_id
+               WHERE request.thread_id = waiting.thread_id AND request.status = 'pending'
+                 AND request.kind NOT IN (${SELF_SETTLED.map((k) => `'${k}'`).join(", ")})
+                 AND (gate.parent_node_id = item.node_id
+                   OR request.provider_turn_id = item.provider_turn_id
+                     AND json_extract(request.payload_json, '$.nativeRequestRef.nativeId')
+                       = json_extract(item.payload_json, '$.nativeItemRef.nativeId'))
+             ))
+           UNION ALL
+           SELECT waiting.thread_id, json_extract(task.value, '$.kind'),
+             json_extract(task.value, '$.childThreadId')
+           FROM waiting
+           JOIN orchestration_v2_projection_provider_threads AS roster
+             ON roster.thread_id = waiting.thread_id
+             AND roster.provider_thread_id = COALESCE(waiting.provider_thread_id, roster.provider_thread_id)
+           JOIN json_each(roster.payload_json, '$.pendingBackgroundTasks') AS task
+           UNION ALL
+           SELECT waiting.thread_id, 'run', NULL
+           FROM waiting
+           LEFT JOIN orchestration_v2_projection_runtime_requests AS request
+             ON request.runtime_request_id = waiting.request_id
+           LEFT JOIN orchestration_v2_projection_nodes AS gate ON gate.node_id = request.node_id
+           WHERE gate.run_id IS NOT waiting.run_id`,
+        )
+        .all(
+          JSON.stringify(
+            Array.from(waiting, (t) => ({
+              id: t.id,
+              activeProviderThreadId: t.activeProviderThreadId,
+              activeRunId: t.activeRunId,
+              requestId: t.pendingRuntimeRequest.id,
+            })),
+          ),
+        );
+      return new Set(rows.filter(ownWork).map((r) => r.threadId));
+    } finally {
+      db.close();
+    }
+  } catch (e) {
+    log("background work unavailable", e.message);
+    return new Set(Array.from(waiting, (t) => t.id));
+  }
+}
+
+/**
+ * Agent runs in flight and background work, but not runs waiting on a person with nothing else
+ * running: those count apart.
+ */
 async function checkWorking() {
   const res = await fetch(`${T3_ORIGIN}/api/orchestration/shell`, {
     headers: { authorization: `Bearer ${config.t3Token}`, "x-t3-orchestration-protocol": "2" },
     signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(`shell snapshot: HTTP ${res.status}`);
-  const shell = await res.json();
-  const live = (shell.threads ?? []).filter(
+  const threads = (await res.json()).threads ?? [];
+  // A subagent T3 runs as its own thread on this machine counts by its own state: waiting for it
+  // holds nothing more, so a child waiting on a person doesn't keep its parent's machine up. A
+  // provider's own background agent shows no runs of its own, and one elsewhere isn't seen here:
+  // both hold it through the parent.
+  const here = new Set(threads.filter((t) => t.creationSource !== "provider").map((t) => t.id));
+  const ownWork = (task) => !(task.kind === "subagent" && here.has(task.childThreadId));
+  // T3 lists a watched pull request as a task, awaited only while its checks run: after that a
+  // person moves it next, so it holds nothing. T3 adds these to the shell's list alone, never to
+  // the provider roster read beside a prompt.
+  const holds = (task) => ownWork(task) && !(task.taskId.startsWith("pull-request-watch:") && task.awaited !== true);
+  // A pending request alone is no run: one left after a restart has none.
+  const running = (t) => t.activeRunId != null || t.activityRunStatus != null || LIVE_STATUSES.has(t.status);
+  const waiting = new Set(threads.filter((t) => running(t) && waitsOnPerson(t)));
+  const besidePrompt = workingBesidePrompt(waiting, ownWork);
+  const live = threads.filter(
     (t) =>
-      t.activeRunId != null ||
-      t.activityRunStatus != null ||
-      LIVE_STATUSES.has(t.status) ||
-      t.pendingRuntimeRequest != null ||
-      (t.pendingBackgroundTasks?.length ?? 0) > 0,
+      (t.pendingBackgroundTasks ?? []).some(holds) ||
+      (running(t) && (!waiting.has(t) || besidePrompt.has(t.id))),
   );
   const subagents = live.filter((t) => t.lineage?.relationshipToParent === "subagent").length;
-  return { threads: live.length - subagents, subagents };
+  return { threads: live.length - subagents, subagents, waiting: waiting.size };
 }
 
 /** The orchestration high-water marks T3 itself compares resume cursors against. */
@@ -252,16 +382,25 @@ function readManifest() {
   }
 }
 
-/** Saves the snapshot, then drains, unless the machine is used meanwhile. */
+/**
+ * Saves the snapshot awake after an unacked drain, then drains on with it seen to: the next tick
+ * that finds the machine idle stops it. Any use meanwhile calls the sleep off; the save runs on
+ * and covers nothing. The drain's manifest stays: events since it call the stop off too.
+ */
 async function save() {
   phase = "saving";
-  const mine = ++saves;
+  saveRunning = true;
   log("saving snapshot", config.snapshot);
   // A machine that cannot save still sleeps: it must not bill on, and Boat keeps its disk 14 days.
   await boat(["snapshot", "self", config.snapshot], SNAPSHOT_TIMEOUT_MS).catch((e) => log("snapshot failed", e.message));
-  if (phase === "saving" && mine === saves) drain();
+  saveRunning = false;
+  // Called off: it covers nothing. Still saving, it is this sleep's own: none starts beside one.
+  if (phase !== "saving") return;
+  snapshotCovered = true;
+  phase = "draining";
 }
 
+/** Publishes the manifest. Only right after a fresh check found no agent working. */
 function drain() {
   try {
     manifest = readManifest();
@@ -287,6 +426,7 @@ function hold(reason) {
   if (phase !== "active") log(`back to active: ${reason}`);
   phase = "active";
   manifest = null;
+  snapshotCovered = false;
 }
 
 /** Runs the Boat CLI, in a login shell for its PATH. */
@@ -310,6 +450,8 @@ function stopSelf() {
 
 async function tick() {
   const now = Date.now();
+  // A drain begun during this tick's checks (by "Sleep now") waits for the next tick's.
+  const drainBefore = drainStartedAt;
   if (now - lastTickAt > RESUMED_GAP_MS) {
     setKeepAwake(0);
     touch("resumed");
@@ -337,19 +479,33 @@ async function tick() {
   if (unknownBusy()) return;
 
   const idleMs = now - lastActivityAt;
-  // Not awaited: ticks go on during the save, so an agent starting to work calls it off.
-  if (phase === "active" && idleMs >= config.sleepAfterSecs * 1000) save();
-  else if (phase === "draining" && now - drainStartedAt >= DRAIN_GRACE_MS) finishDrain();
+  if (phase === "active" && idleMs >= config.sleepAfterSecs * 1000) drain();
+  // Only here, past every check above, does a drain end in a stop. Not while a save of its own
+  // runs: one called off could finish after the app's.
+  else if (
+    phase === "draining" &&
+    drainStartedAt === drainBefore &&
+    !saveRunning &&
+    (snapshotCovered || now - drainStartedAt >= DRAIN_GRACE_MS)
+  )
+    finishDrain();
 }
 
-/** Stops, unless anything happened since the manifest: then someone uses the machine after all. */
-function finishDrain() {
+/** Anything happened since the manifest: someone uses the machine after all. */
+function newEvents() {
   let current = null;
   try {
     current = readManifest();
   } catch {}
-  if (manifest && current && current.sequence !== manifest.sequence) return touch("new events");
-  stopSelf();
+  return manifest !== null && current !== null && current.sequence !== manifest.sequence;
+}
+
+/** Stops once the snapshot is seen to, else saves it first. */
+function finishDrain() {
+  if (newEvents()) return touch("new events");
+  if (snapshotCovered) stopSelf();
+  // Not awaited: ticks go on during a save, so an agent starting to work calls it off.
+  else save();
 }
 
 function status() {
@@ -360,6 +516,8 @@ function status() {
     agentsUnknown: unknownBusy(),
     workingThreads: working.threads,
     workingSubagents: working.subagents,
+    // Not busy, but a T3 restart would expire what they wait on.
+    waitingThreads: working.waiting,
     keepAwakeForever: keepAwakeUntil === Infinity,
     keepAwakeSecs: Number.isFinite(keepAwakeUntil) ? Math.max(0, Math.ceil((keepAwakeUntil - Date.now()) / 1000)) : 0,
     idleSecs: Math.floor((Date.now() - lastActivityAt) / 1000),
@@ -412,7 +570,8 @@ const server = createServer(async (req, res) => {
       return reply(200, status());
     }
     if (req.method === "POST" && req.url === "/drain") {
-      // "Sleep now" from the tray. Never mid-turn; it does end a keep-awake.
+      // "Sleep now" from the tray. Never mid-turn; it does end a keep-awake. Drains on this fresh
+      // check; the tick decides the stop as usual.
       await refreshWorking();
       // A busy CPU alone doesn't refuse: "Sleep now" is the user's explicit call.
       if (agentsBusy()) {
@@ -420,7 +579,7 @@ const server = createServer(async (req, res) => {
         return reply(409, { error, ...status() });
       }
       setKeepAwake(0);
-      if (phase === "active") save();
+      if (phase === "active") drain();
       sleepRequested = true;
       return reply(200, status());
     }
@@ -437,15 +596,10 @@ const server = createServer(async (req, res) => {
       return reply(200, status());
     }
     if (req.method === "POST" && req.url === "/sleep-ack") {
-      // The proxy captured this state: no need to wait out the grace period.
+      // The proxy captured this state and saves the snapshot once stopped: no need to wait out
+      // the grace period. The next tick decides the stop, after its usual checks.
       const { sequence } = JSON.parse((await readBody(req)) || "{}");
-      const acked = () => phase === "draining" && manifest && sequence === manifest.sequence;
-      if (!acked()) return reply(200, status());
-      // A run started since the last tick (an automation, not via the proxy) shows only here.
-      await refreshWorking();
-      if (agentsWorking()) touch("agent working");
-      // Can't tell: the next tick decides. A hold during the check calls the stop off.
-      else if (!unknownBusy() && acked()) finishDrain();
+      if (phase === "draining" && manifest && sequence === manifest.sequence) snapshotCovered = true;
       return reply(200, status());
     }
     reply(404, { error: "not found" });

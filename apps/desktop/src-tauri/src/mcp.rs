@@ -226,7 +226,7 @@ fn tool_list() -> Value {
         ),
         tool(
             "sleep_machine",
-            "Puts a machine to sleep now instead of after 5 idle minutes. Refused while an agent works on it.",
+            "Puts a machine to sleep now instead of after 3 idle minutes. Refused while an agent works on it.",
             json!({ "machine": machine }),
             &["machine"],
         ),
@@ -244,8 +244,8 @@ fn tool_list() -> Value {
         tool(
             "resize_machine",
             "Changes a machine's size. An asleep machine applies it on its next wake; an idle one \
-             sleeps and wakes onto it now (about a minute, unavailable meanwhile); a working one (agent or build) applies it \
-             after it next sleeps.",
+             sleeps and wakes onto it now (unavailable meanwhile); a working one (agent or build), or one where \
+             an agent waits on the user, applies it after it next sleeps.",
             json!({ "machine": machine, "size": size("New size") }),
             &["machine", "size"],
         ),
@@ -265,7 +265,7 @@ fn tool_list() -> Value {
             "Turns on T3 Connect on a machine, so the user's other devices (the T3 Code phone app, a \
              browser) reach it with their T3 account. Opens T3's sign-in page in the user's browser on \
              this computer; the user must approve it there, so tell them to. Restarts T3 on the \
-             machine, so it refuses while an agent works there. A sleeping machine still wakes only \
+             machine, so it refuses while an agent works there or waits on the user. A sleeping machine still wakes only \
              through t3boat on this computer.",
             json!({ "machine": machine }),
             &["machine"],
@@ -279,7 +279,7 @@ fn tool_list() -> Value {
         ),
         tool(
             "set_auto_sleep",
-            "Auto sleep on (default: the machine sleeps 5 minutes after its agents finish) or off (it \
+            "Auto sleep on (default: the machine sleeps 3 minutes after its agents finish) or off (it \
              stays up, and bills, until turned back on). Turning it off wakes a sleeping machine.",
             json!({ "machine": machine, "on": { "type": "boolean" } }),
             &["machine", "on"],
@@ -389,7 +389,7 @@ async fn run(app: &Arc<App>, call: Call) -> Result<String> {
         Call::ResizeMachine { machine, size } => {
             let m = app.machine(&machine)?;
             m.resize(&size).await?;
-            format!("{} is set to {size}; it applies when it next wakes (right away if it was idle).", m.record().name)
+            format!("{} is set to {size}; it applies when it next wakes (right away if it was idle and no agent waited on the user).", m.record().name)
         }
         Call::SignInAgent { machine, agent } => {
             let a = Agent::from_name(&agent).ok_or_else(|| anyhow!("agent must be Claude or Codex"))?;
@@ -407,7 +407,7 @@ async fn run(app: &Arc<App>, call: Call) -> Result<String> {
             let m = app.machine(&machine)?;
             m.keep_awake(if on { Some(0) } else { None }).await?;
             match on {
-                true => format!("{} sleeps 5 minutes after its agents finish again.", m.record().name),
+                true => format!("{} sleeps 3 minutes after its agents finish again.", m.record().name),
                 false => format!("{} stays up until auto sleep is turned back on.", m.record().name),
             }
         }

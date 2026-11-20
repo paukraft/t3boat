@@ -18,9 +18,14 @@ impl MachineRuntime {
     /// signed in to their T3 account in the browser.
     pub async fn turn_on_connect(&self) -> Result<()> {
         self.ensure_awake().await?;
-        // `t3 up` restarts T3 to start the tunnel, which stops running agent turns.
-        if self.watchdog_get("/status?fresh").await?.busy {
+        // `t3 up` restarts T3 to start the tunnel, which stops running agent turns and expires
+        // the approvals they wait on.
+        let s = self.watchdog_get("/status?fresh").await?;
+        if s.busy {
             bail!("an agent is working; turn T3 Connect on once it finishes");
+        }
+        if s.waiting_threads > 0 {
+            bail!("an agent is waiting on you there; answer it, then turn T3 Connect on");
         }
         self.kept_awake(self.run_connect_setup()).await?;
         // A webhook sent while the machine sleeps is then held by T3 Connect's relay and run as

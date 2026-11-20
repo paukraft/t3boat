@@ -47,7 +47,7 @@ export function SettingsView({ state, onSave, onAddMcp, onQuit, onBack }: Props)
       <SubHeader title="Settings" onBack={onBack} />
       <div className="view-body settings">
         <p className="hint">
-          Machines sleep 5 minutes after their agents finish and wake by themselves when you use them in T3 Code.
+          Machines sleep 3 minutes after their agents finish and wake by themselves when you use them in T3 Code.
         </p>
         <label className="setting setting-row">
           <span className="setting-name">Start at login</span>

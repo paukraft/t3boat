@@ -4,20 +4,24 @@
 use crate::boat::{Boat, Starts};
 use crate::machine::{provision, Event, MachineRuntime, Power, Shared, WatchdogPhase};
 use crate::proxy;
-use crate::store::{Settings, Spend, State, Store};
+use crate::store::{Doomed, Settings, Spend, State, Store};
 use crate::t3desktop::T3Desktop;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
 const FIRST_PORT: u16 = 47731;
 /// Machines ever created here: deleted ones keep their port.
 const PORTS: u16 = 1000;
+/// How often a delete Boat hasn't confirmed is tried again.
+const REAP_RETRY: Duration = Duration::from_secs(60);
+/// Pending this long since this launch first tried it: the user is told, and it is tried on.
+const REAP_WARN: Duration = Duration::from_secs(15 * 60);
 
 /// Why the app cannot run yet, in the order the user has to fix it.
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq)]
@@ -73,6 +77,8 @@ pub struct MachineView {
     /// When a "keep awake" runs out (unix ms); none when off or until stopped.
     pub keep_awake_until: Option<u64>,
     pub keep_awake_forever: bool,
+    /// An agent there waits on the user: a resize waits for the next sleep.
+    pub waiting: bool,
 }
 
 /// `detail` as `template` with `{left}` filled in: the time left until `ends_at` (unix ms).
@@ -125,6 +131,24 @@ struct Creating {
     sandbox: Option<String>,
 }
 
+impl Creating {
+    /// Its sandbox and the snapshot its watchdog saves, as `provision::create` names it: the
+    /// machine's id is its first sandbox's.
+    fn doomed(&self) -> Option<Doomed> {
+        let id = self.sandbox.as_ref()?;
+        Some(Doomed { sandbox: Some(id.clone()), snapshot: Some(provision::snapshot_name(&self.name, id)) })
+    }
+}
+
+/// What the reaper knows this launch of one it deletes.
+struct Reaping {
+    since: Instant,
+    /// The user was told it stays pending.
+    told: bool,
+    /// Its delete ran: only then does Boat's list leaving it out confirm it gone.
+    deleted: bool,
+}
+
 struct Running {
     machine: Arc<MachineRuntime>,
     tasks: Vec<JoinHandle<()>>,
@@ -140,8 +164,10 @@ pub struct App {
     /// By sandbox id, gone sandboxes included: `Spend`.
     spend: Mutex<HashMap<String, Spend>>,
     retired_ports: Mutex<Vec<u16>>,
-    /// Sandboxes of creates the app didn't live to finish, until deleted.
-    leftover_sandboxes: Mutex<Vec<String>>,
+    /// What the reaper deletes until Boat confirms it gone. Saved, so a quit picks up next launch.
+    doomed: Mutex<Vec<Doomed>>,
+    /// Wakes the reaper for something just given up.
+    reaper: Notify,
 }
 
 impl App {
@@ -153,11 +179,13 @@ impl App {
     ) -> Result<Arc<Self>> {
         let store = Store::new(&data_dir);
         let state = store.load().context("reading t3boat state")?;
-        // A machine saved meanwhile owns its sandbox.
-        let leftover: Vec<String> = state
-            .pending_sandboxes
+        let sandboxes = state.pending_sandboxes.into_iter().map(|s| Doomed { sandbox: Some(s), snapshot: None });
+        // A machine saved meanwhile owns its sandbox and snapshot.
+        let doomed: Vec<Doomed> = state
+            .doomed
             .into_iter()
-            .filter(|s| !state.machines.iter().any(|m| &m.sandbox_id == s))
+            .chain(sandboxes)
+            .filter(|d| !state.machines.iter().any(|m| d.sandbox.as_ref() == Some(&m.sandbox_id)))
             .collect();
         let shared = Arc::new(Shared {
             boat,
@@ -169,6 +197,7 @@ impl App {
                 // Boat answers an unrouted port with a redirect to its fallback page.
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
+            saving: Mutex::new(HashSet::new()),
         });
         let app = Arc::new(Self {
             shared,
@@ -179,37 +208,119 @@ impl App {
             starts: Mutex::new(Starts::default()),
             spend: Mutex::new(state.spend),
             retired_ports: Mutex::new(state.retired_ports),
-            leftover_sandboxes: Mutex::new(leftover),
+            doomed: Mutex::new(doomed),
+            reaper: Notify::new(),
         });
         for record in state.machines {
             app.spawn(app.runtime(record));
         }
-        tokio::spawn(app.clone().delete_leftover_sandboxes());
+        tokio::spawn(app.clone().reap());
         Ok(app)
     }
 
-    async fn delete_leftover_sandboxes(self: Arc<Self>) {
-        let sandboxes = self.leftover_sandboxes.lock().unwrap().clone();
-        for id in sandboxes {
-            self.delete_leftover(&id).await;
+    /// Deletes what was given up until Boat confirms each gone: a sandbox left behind bills
+    /// without limit, and Boat can be down for a while. Done only on Boat's own list, never on
+    /// a delete's answer alone.
+    async fn reap(self: Arc<Self>) {
+        let mut reaping: HashMap<String, Reaping> = HashMap::new();
+        loop {
+            if self.reap_pass(&mut reaping).await {
+                tokio::select! {
+                    _ = self.reaper.notified() => {}
+                    _ = tokio::time::sleep(REAP_RETRY) => {}
+                }
+            } else {
+                self.reaper.notified().await;
+            }
         }
     }
 
-    /// Unfinished, unlisted and billed without limit: deleted, or the user told. Kept until Boat
-    /// confirms it gone, so the next launch tries again.
-    async fn delete_leftover(&self, id: &str) {
+    /// Works each doomed pair, its sandbox first, its snapshot once the sandbox is confirmed
+    /// gone. Returns whether any is left.
+    async fn reap_pass(&self, reaping: &mut HashMap<String, Reaping>) -> bool {
+        let doomed = self.doomed.lock().unwrap().clone();
         let boat = &self.shared.boat;
-        if let Err(e) = boat.delete(id).await {
-            if !boat.confirmed_gone(id).await {
-                self.shared.notify(
-                    "A sandbox may be left on Boat",
-                    format!("Couldn't delete {id} from an unfinished create ({e:#}); delete it with `boat delete {id}`"),
-                );
-                return;
+        let sandboxes = if doomed.iter().any(|d| d.sandbox.is_some()) {
+            let listed = boat.list().await.map(|l| l.into_iter().map(|s| s.id).collect::<Vec<_>>());
+            listed.inspect_err(|e| tracing::warn!("listing sandboxes to confirm deletes: {e:#}")).ok()
+        } else {
+            None
+        };
+        let snapshots = if doomed.iter().any(|d| d.sandbox.is_none()) {
+            let listed = boat.named_snapshots().await;
+            listed.inspect_err(|e| tracing::warn!("listing snapshots to confirm deletes: {e:#}")).ok()
+        } else {
+            None
+        };
+        let mut confirmed = false;
+        for pair in doomed {
+            let mut left = pair.clone();
+            if let Some(id) = &pair.sandbox {
+                // Its snapshot is being saved: deleted after, or the save could outlive the
+                // snapshot's delete.
+                if self.shared.saving.lock().unwrap().contains(id) {
+                    continue;
+                }
+                let delete = boat.delete(id);
+                if !self.reap_one(reaping, id, sandboxes.as_deref(), "sandbox", "boat delete", delete).await {
+                    continue;
+                }
+                left.sandbox = None;
+            }
+            if let Some(name) = &pair.snapshot {
+                let delete = boat.delete_snapshot(name);
+                if self.reap_one(reaping, name, snapshots.as_deref(), "saved snapshot", "boat snapshot rm", delete).await {
+                    left.snapshot = None;
+                }
+            }
+            if left != pair {
+                confirmed = true;
+                let mut doomed = self.doomed.lock().unwrap();
+                if let Some(i) = doomed.iter().position(|d| *d == pair) {
+                    if left == Doomed::default() {
+                        doomed.remove(i);
+                    } else {
+                        doomed[i] = left;
+                    }
+                }
             }
         }
-        self.leftover_sandboxes.lock().unwrap().retain(|s| s != id);
-        self.shared.persist();
+        if confirmed {
+            self.shared.persist();
+        }
+        !self.doomed.lock().unwrap().is_empty()
+    }
+
+    /// Deletes `key` unless Boat's `listed` confirms it gone, which counts only after a delete
+    /// ran: a list can leave out one it still bills. With no list (`None`, as when it failed),
+    /// it is deleted again. Tells the user once of one pending past `REAP_WARN`. Returns whether
+    /// it is confirmed gone.
+    async fn reap_one(
+        &self,
+        reaping: &mut HashMap<String, Reaping>,
+        key: &str,
+        listed: Option<&[String]>,
+        what: &str,
+        cmd: &str,
+        delete: impl Future<Output = Result<()>>,
+    ) -> bool {
+        let p = reaping.entry(key.to_owned()).or_insert(Reaping { since: Instant::now(), told: false, deleted: false });
+        if p.deleted && listed.is_some_and(|l| !l.iter().any(|k| k == key)) {
+            reaping.remove(key);
+            return true;
+        }
+        if let Err(e) = delete.await {
+            tracing::warn!("deleting {what} {key}: {e:#}");
+        }
+        p.deleted = true;
+        if !p.told && p.since.elapsed() >= REAP_WARN {
+            p.told = true;
+            self.shared.notify(
+                "Boat hasn't confirmed a delete",
+                format!("The {what} {key} may still be on Boat. t3boat keeps trying; `{cmd} {key}` deletes it by hand."),
+            );
+        }
+        false
     }
 
     fn machine_dir(&self, id: &str) -> PathBuf {
@@ -259,15 +370,20 @@ impl App {
         // One lock at a time: a guard in a field initializer would live until the end of the `let`.
         let spend = self.spend.lock().unwrap().clone();
         let retired_ports = self.retired_ports.lock().unwrap().clone();
-        let creating: Vec<_> = self.creating.lock().unwrap().iter().filter_map(|c| c.sandbox.clone()).collect();
-        let mut pending_sandboxes = self.leftover_sandboxes.lock().unwrap().clone();
-        pending_sandboxes.extend(creating);
+        // In this order: a sandbox moves from `creating` to a machine or `doomed`, and from a
+        // machine to `doomed`, each added before it leaves, so a racing save sees it in one or
+        // both, never neither. `App::new` gives "both" to the machine. A create still running is
+        // saved as doomed: deleted at the next launch if the app quit before it finished.
+        let creating: Vec<Doomed> = self.creating.lock().unwrap().iter().filter_map(Creating::doomed).collect();
+        let machines = self.machines().iter().map(|m| m.record()).collect();
+        let doomed = self.doomed.lock().unwrap().iter().cloned().chain(creating).collect();
         let state = State {
-            machines: self.machines().iter().map(|m| m.record()).collect(),
+            machines,
             settings: self.settings(),
             spend,
             retired_ports,
-            pending_sandboxes,
+            doomed,
+            pending_sandboxes: Vec::new(),
         };
         if let Err(e) = self.store.save(&state) {
             tracing::error!("saving state: {e:#}");
@@ -346,17 +462,21 @@ impl App {
             Ok::<_, anyhow::Error>(machine)
         }
         .await;
-        // A failed create's sandbox becomes a leftover: deleted now, or retried at the next launch.
-        let leftover = {
+        // A failed create's sandbox goes to the reaper, with `creating` still locked: see `save`.
+        let failed = {
             let mut creating = self.creating.lock().unwrap();
-            let sandbox = creating.iter().position(|c| c.name == name).and_then(|i| creating.remove(i).sandbox);
-            sandbox.filter(|_| result.is_err())
+            let c = creating.iter().position(|c| c.name == name).map(|i| creating.remove(i));
+            let doomed = c.filter(|_| result.is_err()).as_ref().and_then(Creating::doomed);
+            let failed = doomed.is_some();
+            if let Some(d) = doomed {
+                self.doomed.lock().unwrap().push(d);
+            }
+            failed
         };
-        self.leftover_sandboxes.lock().unwrap().extend(leftover.clone());
         self.shared.persist();
         self.shared.changed();
-        if let Some(id) = leftover {
-            self.delete_leftover(&id).await;
+        if failed {
+            self.reaper.notify_one();
         }
         let machine = result?;
         let (app, m) = (self.clone(), machine.clone());
@@ -417,26 +537,18 @@ impl App {
         if !discard {
             machine.check_idle_before_delete().await?;
         }
-        let boat = &self.shared.boat;
         let record = {
             // Held until retired: a later wake then sees Missing, and none restores meanwhile.
             let _waking = machine.waking.lock().await;
-            // Read under the lock: a wake may have restored it onto a new sandbox.
-            let record = machine.record();
-            if let Err(e) = boat.delete(&record.sandbox_id).await {
-                // Already gone on Boat is fine; anything else keeps the machine.
-                if !boat.confirmed_gone(&record.sandbox_id).await {
-                    return Err(e);
-                }
-            }
             machine.retire();
-            record
+            // Read under the lock: a wake may have restored it onto a new sandbox.
+            machine.record()
         };
         let id = record.id.as_str();
-        // None yet if it never slept with this app's watchdog.
-        if let Err(e) = boat.delete_snapshot(&provision::snapshot_name(&record.name, &record.id)).await {
-            tracing::warn!("deleting {id}'s snapshot: {e:#}");
-        }
+        // The reaper deletes them on Boat, saved with the state below, until Boat confirms each
+        // gone. The snapshot exists only if the machine ever slept with this app's watchdog.
+        let snapshot = provision::snapshot_name(&record.name, &record.id);
+        self.doomed.lock().unwrap().push(Doomed { sandbox: Some(record.sandbox_id.clone()), snapshot: Some(snapshot) });
         let running = {
             let mut machines = self.machines.write().unwrap();
             let idx = machines.iter().position(|r| r.machine.id() == id);
@@ -445,13 +557,15 @@ impl App {
         if let Some(r) = running {
             r.tasks.iter().for_each(JoinHandle::abort);
         }
-        let _ = std::fs::remove_dir_all(machine.dir());
         self.retired_ports.lock().unwrap().push(record.local_port);
+        // Saved before the slow part: a quit meanwhile must not bring back a machine with no dir.
+        self.shared.persist();
+        self.shared.changed();
+        self.reaper.notify_one();
+        let _ = std::fs::remove_dir_all(machine.dir());
         if let Err(e) = self.shared.t3.unlink(&record.environment_id).await {
             tracing::warn!("unlinking {id} from T3 Code: {e:#}");
         }
-        self.shared.persist();
-        self.shared.changed();
         if !record.client_tokens.is_empty() {
             self.shared.notify(
                 format!("Remove {} from T3 Code", record.name),
@@ -477,6 +591,7 @@ impl App {
                 projects: Vec::new(),
                 keep_awake_until: None,
                 keep_awake_forever: false,
+                waiting: false,
             });
         }
         views
@@ -672,7 +787,8 @@ fn view(m: &MachineRuntime) -> MachineView {
         }
         (Power::Running, Some(w)) if w.phase == WatchdogPhase::Active => {
             let left = w.sleep_after_secs.saturating_sub(w.idle_secs);
-            (Idle, count_down("Idle · sleeps in {left}", left, w.received))
+            let template = if w.waiting_threads > 0 { "Waiting on you · sleeps in {left}" } else { "Idle · sleeps in {left}" };
+            (Idle, count_down(template, left, w.received))
         }
         (Power::Running, Some(_)) | (Power::Stopping, _) => (Sleeping, "Going to sleep".to_owned()),
         (Power::Running, None) => (Idle, "Running".to_owned()),
@@ -698,6 +814,7 @@ fn view(m: &MachineRuntime) -> MachineView {
             .filter(|w| w.keep_awake_secs > 0)
             .map(|w| unix_ms_after(w.received, w.keep_awake_secs)),
         keep_awake_forever: running_watchdog.is_some_and(|w| w.keep_awake_forever),
+        waiting: running_watchdog.is_some_and(|w| w.waiting_threads > 0),
     }
 }
 
@@ -776,5 +893,132 @@ mod tests {
         assert_eq!((later_day.today, later_day.awake_secs_today, later_day.month), (0.0, 0, 5.0));
         let later_month = super::usage(&spend, 300, 300);
         assert_eq!((later_month.today, later_month.month), (0.0, 0.0));
+    }
+
+    /// A Boat CLI that logs each call. `list` fails while `list-down` exists; `bx_a` deletes once
+    /// `up` exists, `bx_ghost` (never listed) always, `bx_stuck` (always listed) never.
+    #[cfg(unix)]
+    const FLAKY_BOAT: &str = r#"#!/bin/sh
+d=$(dirname "$0"); shift
+echo "$*" >> "$d/log"
+case "$1" in
+  list) [ -f "$d/list-down" ] && exit 1
+    a='{"id":"bx_a","state":"running"},'; [ -f "$d/bx_a-gone" ] && a=
+    echo "{\"sandboxes\":[$a{\"id\":\"bx_stuck\",\"state\":\"error\"}]}" ;;
+  delete) case "$2" in
+    bx_a) [ -f "$d/up" ] || { echo 'Boat is down' >&2; exit 1; }; touch "$d/bx_a-gone" ;;
+    bx_ghost|bx_new) ;;
+    *) echo 'Boat is down' >&2; exit 1 ;;
+  esac; echo '{}' ;;
+  snapshots) a='{"name":"snap-a"},'; [ -f "$d/snap-a-rm" ] && a=
+    echo "{\"named\":[$a{\"name\":\"snap-b\"}]}" ;;
+  snapshot) touch "$d/$3-rm"; echo '{"status":"deleted"}' ;;
+  *) exit 1 ;;
+esac
+"#;
+
+    #[cfg(unix)]
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// What a quit left to delete is deleted at the next launch, kept through refused deletes and
+    /// failed lists, and dropped only once Boat's list confirms it gone after a delete, even one
+    /// the list never showed. A pair's snapshot waits for its own sandbox only, a sandbox for a
+    /// save of it. A create the quit interrupted goes with the snapshot its watchdog may have saved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaper_deletes_until_boat_confirms() {
+        use crate::store::Doomed;
+        use std::os::unix::fs::PermissionsExt;
+        let pair = |sandbox: Option<&str>, snapshot: Option<&str>| Doomed {
+            sandbox: sandbox.map(Into::into),
+            snapshot: snapshot.map(Into::into),
+        };
+        let dir = std::env::temp_dir().join(format!("t3boat-reaper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("boat");
+        std::fs::write(&bin, FLAKY_BOAT).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("list-down"), "").unwrap();
+        let store = crate::store::Store::new(&dir);
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let launch = || {
+            let t3 = crate::t3desktop::T3Desktop::at(dir.join("t3"));
+            super::App::new(crate::boat::Boat::at(bin.clone()), t3, dir.clone(), events.clone()).unwrap()
+        };
+
+        // The launch that quits: two deleted machines and a create past its sandbox. Its reaper
+        // starts with nothing to do and is never woken.
+        let quit = launch();
+        quit.doomed.lock().unwrap().extend([pair(Some("bx_a"), Some("snap-a")), pair(Some("bx_stuck"), Some("snap-b"))]);
+        let port = super::FIRST_PORT;
+        quit.creating.lock().unwrap().push(super::Creating { name: "new".into(), step: String::new(), port, sandbox: Some("bx_new".into()) });
+        quit.save();
+        // `pendingSandboxes` as an older state file has it.
+        let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+        state["pendingSandboxes"] = serde_json::json!(["bx_ghost"]);
+        std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+
+        let app = launch();
+        let doomed = || app.doomed.lock().unwrap().clone();
+        let log = || std::fs::read_to_string(dir.join("log")).unwrap_or_default();
+        let ran = |call: &str| log().lines().any(|l| l == call);
+
+        // Launch pass: the sandbox list fails, every delete still runs, nothing is dropped.
+        until("the first pass", || ran("delete bx_ghost --yes")).await;
+        for call in ["delete bx_a --yes", "delete bx_stuck --yes", "delete bx_new --yes"] {
+            assert!(ran(call), "{call} despite the failed list");
+        }
+        assert!(!log().contains("snapshot rm"), "snapshots wait for their sandboxes");
+        let all = vec![
+            pair(Some("bx_a"), Some("snap-a")),
+            pair(Some("bx_stuck"), Some("snap-b")),
+            pair(Some("bx_new"), Some("t3boat-new-bx-new")),
+            pair(Some("bx_ghost"), None),
+        ];
+        assert_eq!(doomed(), all, "all kept after refused deletes and a failed list");
+        app.save();
+        assert_eq!(store.load().unwrap().doomed, all, "saved for the next launch");
+
+        // Boat is back: the list confirms the two sandboxes it never showed, so the interrupted
+        // create's snapshot goes now; `bx_a` is deleted now.
+        std::fs::remove_file(dir.join("list-down")).unwrap();
+        std::fs::write(dir.join("up"), "").unwrap();
+        app.reaper.notify_one();
+        until("ghost and new confirmed", || doomed().len() == 3).await;
+        assert_eq!(doomed()[2], pair(None, Some("t3boat-new-bx-new")));
+        assert!(ran("snapshot rm t3boat-new-bx-new"));
+        assert!(dir.join("bx_a-gone").exists());
+        assert!(!ran("snapshot rm snap-a"), "kept until Boat's list confirms its sandbox gone");
+
+        // `bx_a` confirmed: its snapshot goes, though `bx_stuck` still holds its own. The list
+        // confirms the snapshot it never showed.
+        app.reaper.notify_one();
+        let stuck = pair(Some("bx_stuck"), Some("snap-b"));
+        until("bx_a and the new snapshot confirmed", || doomed() == [pair(None, Some("snap-a")), stuck.clone()]).await;
+        assert!(ran("snapshot rm snap-a"));
+        app.reaper.notify_one();
+        until("snap-a confirmed", || doomed().len() == 1).await;
+        assert_eq!(doomed(), [stuck]);
+        assert!(!ran("snapshot rm snap-b"), "a stuck sandbox holds back its own snapshot");
+
+        // A sandbox whose snapshot is being saved waits for the save.
+        app.shared.saving.lock().unwrap().insert("bx_saving".into());
+        app.doomed.lock().unwrap().push(pair(Some("bx_saving"), Some("snap-s")));
+        app.reap_pass(&mut super::HashMap::new()).await;
+        assert!(!ran("delete bx_saving --yes"), "deleted only once its save ends");
+        app.shared.saving.lock().unwrap().clear();
+        app.reap_pass(&mut super::HashMap::new()).await;
+        assert!(ran("delete bx_saving --yes"));
+        app.doomed.lock().unwrap().retain(|d| d.sandbox.as_deref() != Some("bx_saving"));
+        app.save();
+        assert_eq!(store.load().unwrap().doomed, doomed());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -42,6 +42,9 @@ pub struct Machine {
     /// T3 Connect is on there: other devices reach it with the user's T3 account.
     #[serde(default)]
     pub connect: bool,
+    /// The stop its saved snapshot holds, as this app saved it from the stopped sandbox.
+    #[serde(default)]
+    pub saved_stop: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -90,9 +93,22 @@ pub struct State {
     /// Local ports of deleted machines, never given out again: T3 Code may still list one (it
     /// cannot be told to forget a backend), and would reach a new machine there as the old.
     pub retired_ports: Vec<u16>,
-    /// Sandboxes of creates still running: deleted at the next start if the app quit or crashed
-    /// before the create finished.
+    /// What to delete on Boat until Boat confirms each gone.
+    pub doomed: Vec<Doomed>,
+    /// Older state files' sandboxes of creates still running, loaded into `doomed`. Never written:
+    /// those go to `doomed` now, with their snapshot.
+    #[serde(skip_serializing)]
     pub pending_sandboxes: Vec<String>,
+}
+
+/// A deleted machine's sandbox and saved snapshot, or those of a create that failed or never
+/// finished: its watchdog runs, and can save the snapshot, before the create is done. The
+/// snapshot waits for its sandbox: a live one's watchdog can save it again.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Doomed {
+    pub sandbox: Option<String>,
+    pub snapshot: Option<String>,
 }
 
 pub struct Store {

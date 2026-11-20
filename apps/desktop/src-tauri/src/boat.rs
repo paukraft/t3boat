@@ -76,6 +76,11 @@ impl Boat {
             .map(|bin| Self { bin })
     }
 
+    #[cfg(test)]
+    pub fn at(bin: PathBuf) -> Self {
+        Self { bin }
+    }
+
     /// Runs the CLI; returns whether it succeeded, stdout and stderr.
     async fn output(&self, args: &[&str], timeout: Duration) -> Result<(bool, String, String)> {
         let mut cmd = command(&self.bin);
@@ -159,8 +164,25 @@ impl Boat {
         }
     }
 
+    /// Saves the sandbox's disk as `name`, replacing one of that name. A stopped sandbox stays
+    /// stopped and bills nothing for it.
+    pub async fn save_snapshot(&self, id: &str, name: &str) -> Result<()> {
+        self.run(&["snapshot", id, name], Duration::from_secs(10 * 60)).await.map(drop)
+    }
+
     pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
         self.run(&["snapshot", "rm", name], Duration::from_secs(60)).await.map(drop)
+    }
+
+    /// The saved snapshots' names. A row without one fails: it must never pass as proof of absence.
+    pub async fn named_snapshots(&self) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Named {
+            name: String,
+        }
+        let v = Self::last_json(&self.run(&["snapshots"], Duration::from_secs(20)).await?)?;
+        let named: Vec<Named> = serde_json::from_value(v["named"].clone())?;
+        Ok(named.into_iter().map(|n| n.name).collect())
     }
 
     pub async fn delete(&self, id: &str) -> Result<()> {

@@ -201,7 +201,7 @@ function Power({ m, busy, onAction }: { m: MachineView; busy: boolean; onAction:
         <span className="toggle-text">
           <span className="toggle-name">Auto sleep</span>
           <span className="hint">
-            {on ? "Sleeps 5 min after agents finish; asleep is free" : "Stays up and bills until you turn this back on"}
+            {on ? "Sleeps 3 min after agents finish; asleep is free" : "Stays up and bills until you turn this back on"}
           </span>
         </span>
         <input

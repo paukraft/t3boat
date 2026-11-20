@@ -3,6 +3,7 @@
 
 mod capture;
 mod connect;
+mod disk;
 mod link;
 pub mod projects;
 pub mod provision;
@@ -31,13 +32,14 @@ const BOAT_POLL: Duration = Duration::from_secs(60);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(20);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
-/// A requested sleep: snapshot save, drain grace and the stop itself.
-const SLEEP_TIMEOUT: Duration = Duration::from_secs(600);
+/// A requested sleep: the 45 s grace for the ack, a save called off earlier still running (up
+/// to 10 min), the watchdog's own save when nobody acked (up to 10 min), and the stop settling
+/// (90 s).
+const SLEEP_TIMEOUT: Duration = Duration::from_secs(23 * 60);
 /// After a failed wake, requests fail fast instead of each retrying `boat resume`.
 const WAKE_COOLDOWN: Duration = Duration::from_secs(30);
 /// The watchdog's limit too.
 pub const MAX_KEEP_AWAKE_MINUTES: u32 = 24 * 60;
-const KEEP_ALIVE_AFTER: chrono::TimeDelta = chrono::TimeDelta::days(12);
 const KEEP_ALIVE_RETRY: Duration = Duration::from_secs(3600);
 /// A machine woken for work due is up this much ahead of it: a wake from a snapshot is slow.
 const DUE_LEAD: chrono::TimeDelta = chrono::TimeDelta::minutes(2);
@@ -80,7 +82,8 @@ pub struct Manifest {
 #[serde(rename_all = "lowercase")]
 pub enum WatchdogPhase {
     Active,
-    /// Going to sleep: saving the snapshot it can be restored from. Any use calls it off.
+    /// The watchdog saves the snapshot itself, awake, after a drain nobody acked; always with a
+    /// manifest. Any use calls it off.
     Saving,
     Draining,
     Stopping,
@@ -94,6 +97,10 @@ pub struct WatchdogStatus {
     /// Agent runs in flight.
     pub working_threads: u32,
     pub working_subagents: u32,
+    /// Agent runs waiting on the user (an approval, a question): not busy, but a T3 restart
+    /// would expire what they wait on. Older watchdogs don't say.
+    #[serde(default)]
+    pub waiting_threads: u32,
     /// Busy only because of CPU use (a build or job outside an agent turn).
     pub cpu_busy: bool,
     /// T3 is not answering, so the watchdog keeps it up (at most 30 min) in case an agent works.
@@ -132,6 +139,8 @@ pub struct Shared {
     pub settings: RwLock<Settings>,
     pub events: mpsc::UnboundedSender<Event>,
     pub http: reqwest::Client,
+    /// Sandboxes whose snapshot is being saved: a delete leaves each to its save.
+    pub saving: Mutex<HashSet<String>>,
 }
 
 impl Shared {
@@ -166,6 +175,8 @@ pub struct MachineRuntime {
     stop_seen: Mutex<Option<Instant>>,
     /// The last failed wake: its message and when.
     wake_failure: Mutex<Option<(String, Instant)>>,
+    /// Saving the snapshot failing, until a save succeeds.
+    save_failure: Mutex<Option<disk::SaveFailure>>,
     /// Its T3 projects as last read, and those t3boat is adding.
     projects: Mutex<Vec<projects::MachineProject>>,
     adding: Mutex<Vec<projects::MachineProject>>,
@@ -189,6 +200,7 @@ impl MachineRuntime {
             last_heartbeat: Mutex::new(None),
             stop_seen: Mutex::new(None),
             wake_failure: Mutex::new(None),
+            save_failure: Mutex::new(None),
             projects: Mutex::new(Vec::new()),
             adding: Mutex::new(Vec::new()),
         };
@@ -455,10 +467,10 @@ impl MachineRuntime {
         }
         self.wait_ready(started).await?;
         if resumed {
-            // T3 serves now and may have started work on its own; restarting it would kill that.
-            // A restored machine booted fresh from its snapshot: nothing to kill, and the
-            // upgrade drops the snapshot's stale chats.
-            if !restored && self.watchdog_get("/status?fresh").await.is_ok_and(|s| s.busy) {
+            // T3 serves now and may have started work on its own, or an agent waits on the user;
+            // restarting it would kill that. A restored machine booted fresh from its snapshot:
+            // nothing to kill, and the upgrade drops the snapshot's stale chats.
+            if !restored && self.watchdog_get("/status?fresh").await.is_ok_and(|s| s.busy || s.waiting_threads > 0) {
                 tracing::info!("{id} is busy: upgrade deferred to the next wake");
             } else if let Err(e) = self.upgrade_if_needed().await {
                 tracing::warn!("upgrading {id}: {e:#}");
@@ -479,32 +491,6 @@ impl MachineRuntime {
         if let Err(e) = self.prime().await {
             tracing::warn!("refreshing {}'s session: {e:#}", self.id());
         }
-    }
-
-    /// Boat deleted the stopped sandbox's disk: a new sandbox takes its place, its disk the
-    /// snapshot the watchdog saved at the last sleep. Its addresses differ; the wake hosts them.
-    async fn restore(&self) -> Result<()> {
-        let record = self.record();
-        let boat = &self.shared.boat;
-        tracing::info!("restoring {} from its snapshot", record.id);
-        let sandbox = boat
-            .create(
-                &provision::sandbox_name(&record.name),
-                &record.size,
-                Some(&provision::snapshot_name(&record.name, &record.id)),
-            )
-            .await
-            .context("Boat deleted this machine's disk after 14 days asleep, and restoring its snapshot failed")?;
-        // The snapshot can predate the last upgrade and the stored chats: clearing the version
-        // makes the wake re-provision and drop them.
-        self.update_record(|m| {
-            m.sandbox_id = sandbox;
-            m.t3_version.clear();
-        });
-        if let Err(e) = boat.delete(&record.sandbox_id).await {
-            tracing::warn!("deleting {}'s expired sandbox {}: {e:#}", record.id, record.sandbox_id);
-        }
-        Ok(())
     }
 
     /// Fills what the proxy must answer before the machine can sleep: descriptor and session.
@@ -629,25 +615,11 @@ impl MachineRuntime {
     /// a short sleep, cannot tell: it would refuse activity and report a stop for another 90 s.
     async fn send_activity(&self, resumed: bool) {
         *self.last_heartbeat.lock().unwrap() = Some(Instant::now());
-        match self.watchdog_post("/activity", json!({ "resumed": resumed })).await {
-            Ok(s) => {
-                *self.watchdog.lock().unwrap() = Some(s);
-                self.shared.changed();
-            }
-            // Refused when the watchdog already stops the machine.
-            Err(_) => {
-                self.stopping_now().await;
-            }
+        // Refused when the watchdog already stops the machine: watchdog_request records that.
+        if let Ok(s) = self.watchdog_post("/activity", json!({ "resumed": resumed })).await {
+            *self.watchdog.lock().unwrap() = Some(s);
+            self.shared.changed();
         }
-    }
-
-    /// Asks the watchdog whether it is stopping the machine, and records it if so.
-    async fn stopping_now(&self) -> bool {
-        let stopping = self.watchdog_get("/status").await.is_ok_and(|s| s.phase == WatchdogPhase::Stopping);
-        if stopping {
-            self.mark_stopping();
-        }
-        stopping
     }
 
     async fn watchdog_get(&self, path: &str) -> Result<WatchdogStatus> {
@@ -663,7 +635,8 @@ impl MachineRuntime {
             let m = self.record.read().unwrap();
             (format!("{}{path}", m.watchdog_url.trim_end_matches('/')), m.watchdog_secret.clone())
         };
-        // These routes reply after the watchdog's own T3 check, which allows itself 10 s.
+        // These routes reply after the watchdog's own T3 check, which allows itself 10 s. Older
+        // watchdogs check T3 inside the ack too.
         let refreshes = matches!(path, "/status?fresh" | "/drain" | "/sleep-ack");
         let timeout = Duration::from_secs(if refreshes { 15 } else { 4 });
         let mut req = self.shared.http.request(method, url).bearer_auth(secret).timeout(timeout);
@@ -674,6 +647,13 @@ impl MachineRuntime {
         let status = res.status();
         if status.as_u16() == 409 {
             let value: Value = res.json().await.unwrap_or_default();
+            // Refused mid-stop: recorded now, as Boat may freeze the machine before a next ask.
+            if value["phase"] == "stopping" {
+                if let Some(sequence) = value["manifest"]["sequence"].as_u64() {
+                    self.confirm_capture(sequence);
+                }
+                self.mark_stopping();
+            }
             bail!("{}", value["error"].as_str().unwrap_or("not now"));
         }
         if !status.is_success() {
@@ -707,19 +687,21 @@ impl MachineRuntime {
         }
         self.ensure_awake().await?;
         // Older scripts lack keep-awake: take this app's now, which restarts T3, so never
-        // mid-turn. Ending a hold works with any watchdog that has one.
+        // mid-turn or while an agent waits on the user. Ending a hold works with any watchdog
+        // that has one.
         if minutes != Some(0) && self.record().provision_revision != provision::revision() {
-            if self.watchdog_get("/status?fresh").await?.busy {
-                bail!("needs a quick update first; try again once its agents finish");
+            let s = self.watchdog_get("/status?fresh").await?;
+            if s.busy || s.waiting_threads > 0 {
+                bail!("needs a quick update first; try again once no agent works or waits on you there");
             }
             self.kept_awake(self.upgrade_if_needed()).await?;
         }
         let body = json!({ "minutes": minutes });
         let s = match self.watchdog_post("/keep-awake", body.clone()).await {
             Ok(s) => s,
-            // Refused mid-stop: ending it is then already done; anything else waits for the stop,
-            // wakes the machine and asks again.
-            Err(_) if self.stopping_now().await => {
+            // Refused mid-stop (watchdog_request recorded it): ending it is then already done;
+            // anything else waits for the stop, wakes the machine and asks again.
+            Err(_) if self.is_stopping() => {
                 if minutes == Some(0) {
                     return Ok(());
                 }
@@ -733,7 +715,8 @@ impl MachineRuntime {
     }
 
     /// New size: applied on the next resume. An idle machine is restarted onto it right away,
-    /// keeping any "keep awake"; a working one (an agent or a build) moves when it next sleeps.
+    /// keeping any "keep awake"; a working one (an agent or a build), or one where an agent waits
+    /// on the user (the restart would expire it), moves when it next sleeps.
     pub async fn resize(&self, size: &str) -> Result<()> {
         provision::size(size)?;
         if self.record().size == size {
@@ -744,7 +727,7 @@ impl MachineRuntime {
             return Ok(());
         }
         let status = match self.watchdog_get("/status").await {
-            Ok(s) if !s.busy => s,
+            Ok(s) if !s.busy && s.waiting_threads == 0 => s,
             _ => return Ok(()),
         };
         // The sleep ends any hold: it is taken again after the restart.
@@ -813,7 +796,9 @@ impl MachineRuntime {
         *self.watchdog.lock().unwrap() = Some(s);
         self.shared.changed();
         match (phase, manifest) {
-            (WatchdogPhase::Draining, Some(m)) => {
+            // Captured during the watchdog's own save too: the chats then need no billable wake
+            // once it stops.
+            (WatchdogPhase::Saving | WatchdogPhase::Draining, Some(m)) => {
                 {
                     // Whoever waited here finds the capture done, and must not redo it: it may
                     // be confirmed by now.
@@ -826,18 +811,29 @@ impl MachineRuntime {
                         }
                     }
                 }
-                // Still draining means the watchdog couldn't stop yet (T3 not answering): leave the
-                // retry to the regular poll instead of re-acking in a loop.
-                match self.watchdog_post("/sleep-ack", json!({ "sequence": m.sequence })).await {
-                    Ok(s) if s.phase != WatchdogPhase::Draining => Box::pin(self.on_watchdog_status(s)).await,
-                    _ => {}
+                // Acked only while draining: a reply still saving would re-ack in a loop.
+                if phase == WatchdogPhase::Draining {
+                    match self.watchdog_post("/sleep-ack", json!({ "sequence": m.sequence })).await {
+                        // Accepted: the watchdog now stops only on a next tick at this sequence,
+                        // which a poll can miss before Boat freezes the machine. Any later use
+                        // ends in a new drain, recaptured, or a stop too late for fresh_capture.
+                        Ok(s) if s.phase == WatchdogPhase::Draining => {
+                            if s.manifest.as_ref().is_some_and(|r| r.sequence == m.sequence) {
+                                self.confirm_capture(m.sequence);
+                            }
+                        }
+                        // Refused as its own save began ("saving": never confirmed, as that save
+                        // delays the stop), or an older watchdog that stopped inside the ack.
+                        Ok(s) => Box::pin(self.on_watchdog_status(s)).await,
+                        Err(_) => {}
+                    }
                 }
             }
             // Stopping without a manifest (the watchdog could not read it) still stops: only
             // the capture goes unconfirmed.
             (WatchdogPhase::Stopping, m) => {
-                if m.is_some_and(|m| self.captured_sequence() == Some(m.sequence)) {
-                    self.confirm_capture();
+                if let Some(m) = m {
+                    self.confirm_capture(m.sequence);
                 }
                 self.mark_stopping();
             }
@@ -907,6 +903,10 @@ impl MachineRuntime {
                     tracing::warn!("waking {} for work due: {e:#}", self.id());
                 }
             }
+            if let Some((sandbox, stop)) = self.begin_save() {
+                let this = self.clone();
+                tokio::spawn(async move { this.save_snapshot(sandbox, stop).await });
+            }
             let running = self.power() == Power::Running;
             let came_up = running && !was_running;
             was_running = running;
@@ -967,14 +967,5 @@ impl MachineRuntime {
             && self.cache.lock().unwrap().deferred_commands.iter().any(|c| {
                 c["type"].as_str().is_some_and(|k| classify::WAKING_COMMANDS.contains(&k))
             })
-    }
-
-    fn needs_keep_alive(&self) -> bool {
-        self.power() == Power::Stopped
-            && self
-                .stopped_at
-                .lock()
-                .unwrap()
-                .is_some_and(|t| chrono::Utc::now() - t > KEEP_ALIVE_AFTER)
     }
 }
