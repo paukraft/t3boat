@@ -120,7 +120,7 @@ let drainStartedAt = 0;
  * stops it. Only hold() clears it.
  */
 let snapshotCovered = false;
-/** A `boat snapshot self` this watchdog started still runs, whether or not its sleep was called off. */
+/** A `boat snapshot` this watchdog started still runs, whether or not its sleep was called off. */
 let saveRunning = false;
 let lastTickAt = Date.now();
 let stopRequestedAt = 0;
@@ -392,7 +392,7 @@ async function save() {
   saveRunning = true;
   log("saving snapshot", config.snapshot);
   // A machine that cannot save still sleeps: it must not bill on, and Boat keeps its disk 14 days.
-  await boat(["snapshot", "self", config.snapshot], SNAPSHOT_TIMEOUT_MS).catch((e) => log("snapshot failed", e.message));
+  await boat(["snapshot", config.sandbox, config.snapshot], SNAPSHOT_TIMEOUT_MS).catch((e) => log("snapshot failed", e.message));
   saveRunning = false;
   // Called off: it covers nothing. Still saving, it is this sleep's own: none starts beside one.
   if (phase !== "saving") return;
@@ -442,9 +442,9 @@ function stopSelf() {
   phase = "stopping";
   stopRequestedAt = Date.now();
   log("stopping sandbox");
-  boat(["stop", "self"]).catch((e) => {
+  boat(["stop", config.sandbox]).catch((e) => {
     log("boat stop failed", e.message);
-    touch("stop failed");
+    hold("stop failed");
   });
 }
 
@@ -458,7 +458,7 @@ async function tick() {
   }
   lastTickAt = now;
   if (phase === "stopping") {
-    if (now - stopRequestedAt > STOP_SETTLE_MS) touch("still running after stop");
+    if (now - stopRequestedAt > STOP_SETTLE_MS) hold("still running after stop");
     return;
   }
 
@@ -521,6 +521,9 @@ function status() {
     keepAwakeForever: keepAwakeUntil === Infinity,
     keepAwakeSecs: Number.isFinite(keepAwakeUntil) ? Math.max(0, Math.ceil((keepAwakeUntil - Date.now()) / 1000)) : 0,
     idleSecs: Math.floor((Date.now() - lastActivityAt) / 1000),
+    // Since a person or an agent last used it; a failed stop doesn't count. The laptop app stops
+    // a machine left running unused for long past its sleep delay.
+    unusedSecs: Math.floor((Date.now() - lastUsedAt) / 1000),
     sleepAfterSecs: config.sleepAfterSecs,
     nextDueAt,
     workDue: dueSoon(),

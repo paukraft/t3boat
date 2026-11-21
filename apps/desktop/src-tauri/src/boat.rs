@@ -185,6 +185,11 @@ impl Boat {
         Ok(named.into_iter().map(|n| n.name).collect())
     }
 
+    /// Stops and snapshots it for resume; returns once Boat took the stop.
+    pub async fn stop(&self, id: &str) -> Result<()> {
+        self.run(&["stop", id], Duration::from_secs(60)).await.map(drop)
+    }
+
     pub async fn delete(&self, id: &str) -> Result<()> {
         self.run(&["delete", id, "--yes"], Duration::from_secs(120))
             .await

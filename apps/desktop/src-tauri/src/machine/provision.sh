@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Runs on a Boat sandbox, as `user`. Idempotent; also used to upgrade a machine.
-#   T3BOAT_SECRET=<watchdog-secret> provision.sh <t3-version> <sleep-after-secs> <snapshot-name> <mint-upstream-token:0|1> <name>
+#   T3BOAT_SECRET=<watchdog-secret> provision.sh <t3-version> <sleep-after-secs> <snapshot-name> <mint-upstream-token:0|1> <name> <sandbox-id>
 # Expects watchdog.mjs next to it. Prints one JSON line: {"environmentId", "upstreamToken"?}.
 set -euo pipefail
 
-version="$1" sleep_after="$2" snapshot="$3" mint_upstream="$4" name="$5"
+version="$1" sleep_after="$2" snapshot="$3" mint_upstream="$4" name="$5" sandbox="$6"
 secret="$T3BOAT_SECRET"
 here="$(cd "$(dirname "$0")" && pwd)"
 t3="$HOME/.local/bin/t3"
@@ -57,16 +57,17 @@ if [ "$ready" != 1 ]; then
   exit 1
 fi
 
-# Watchdog: its own read-only T3 token, kept across upgrades.
+# Watchdog: its own read-only T3 token, kept across upgrades. It names its sandbox by id: no
+# BOAT_ID in its env, so `boat stop self` can't resolve.
 config="$boat_dir/config.json"
 watchdog_token="$(node -e 'try{process.stdout.write(require(process.argv[1]).t3Token||"")}catch{}' "$config")"
 if [ -z "$watchdog_token" ]; then
   watchdog_token="$("$t3" auth session issue --token-only --ttl 3650d --label t3boat-watchdog --scope orchestration:read)"
 fi
-SECRET="$secret" TOKEN="$watchdog_token" SLEEP="$sleep_after" SNAPSHOT="$snapshot" node -e '
+SECRET="$secret" TOKEN="$watchdog_token" SLEEP="$sleep_after" SNAPSHOT="$snapshot" SANDBOX="$sandbox" node -e '
   const e = process.env;
   require("fs").writeFileSync(process.argv[1], JSON.stringify({
-    secret: e.SECRET, t3Token: e.TOKEN, sleepAfterSecs: Number(e.SLEEP), snapshot: e.SNAPSHOT
+    secret: e.SECRET, t3Token: e.TOKEN, sleepAfterSecs: Number(e.SLEEP), snapshot: e.SNAPSHOT, sandbox: e.SANDBOX
   }, null, 2), { mode: 0o600 });
 ' "$config"
 install -m 600 "$here/watchdog.mjs" "$boat_dir/watchdog.mjs"

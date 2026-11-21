@@ -29,6 +29,9 @@ use tokio::sync::{mpsc, watch};
 
 const WATCHDOG_POLL: Duration = Duration::from_secs(5);
 const BOAT_POLL: Duration = Duration::from_secs(60);
+/// Unused this long past its sleep delay, the machine's own stop failed: this app stops it.
+const OVERDUE_SLEEP_SECS: u64 = 5 * 60;
+const OVERDUE_STOP_RETRY: Duration = Duration::from_secs(120);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(20);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -110,6 +113,9 @@ pub struct WatchdogStatus {
     /// Kept awake until someone stops it: no auto sleep at all.
     pub keep_awake_forever: bool,
     pub idle_secs: u64,
+    /// Since a person or an agent last used it. Older watchdogs don't say.
+    #[serde(default)]
+    pub unused_secs: Option<u64>,
     pub sleep_after_secs: u64,
     /// When T3 next starts work on its own, ms since epoch. Older watchdogs don't say.
     #[serde(default)]
@@ -121,6 +127,18 @@ pub struct WatchdogStatus {
     /// When this app got the status: what its second counts are relative to.
     #[serde(skip, default = "SystemTime::now")]
     pub received: SystemTime,
+}
+
+impl WatchdogStatus {
+    /// Nothing holds it up, yet it runs on long past its sleep delay: its own stop failed.
+    fn overdue_sleep(&self) -> bool {
+        let held = self.busy
+            || self.work_due
+            || self.keep_awake_forever
+            || self.keep_awake_secs > 0
+            || self.phase == WatchdogPhase::Saving;
+        !held && self.unused_secs.is_some_and(|u| u >= self.sleep_after_secs + OVERDUE_SLEEP_SECS)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -841,6 +859,27 @@ impl MachineRuntime {
         }
     }
 
+    /// The watchdog failed to stop an unused machine: stopped from here, and the user told, as it
+    /// won't sleep while this Mac is off until that is fixed.
+    async fn stop_overdue(&self) {
+        let record = self.record();
+        tracing::warn!("{} runs unused past its sleep: stopping it from here", record.id);
+        self.mark_stopping();
+        match self.shared.boat.stop(&record.sandbox_id).await {
+            Ok(()) => self.shared.notify(
+                format!("{} didn't go to sleep on its own", record.name),
+                "t3boat put it to sleep from this Mac. Its own sleep is broken: with this Mac off it keeps running.",
+            ),
+            Err(e) => {
+                tracing::warn!("stopping {}: {e:#}", record.id);
+                self.shared.notify(format!("{} won't go to sleep", record.name), format!("{e:#}"));
+            }
+        }
+        if let Err(e) = self.refresh_power().await {
+            tracing::warn!("boat info {}: {e:#}", record.id);
+        }
+    }
+
     /// Known before Boat says so: new sockets and wakes wait for the stop instead of reaching a
     /// machine that is about to freeze.
     fn mark_stopping(&self) {
@@ -868,6 +907,7 @@ impl MachineRuntime {
         let mut last_keep_alive: Option<Instant> = None;
         let mut last_due_wake: Option<Instant> = None;
         let mut last_link_check: Option<Instant> = None;
+        let mut last_overdue_stop: Option<Instant> = None;
         let mut watchdog_failures = 0u32;
         let mut was_busy = false;
         let mut was_running = false;
@@ -942,7 +982,12 @@ impl MachineRuntime {
                             let this = self.clone();
                             tokio::spawn(async move { this.on_ready().await });
                         }
+                        let overdue = s.overdue_sleep();
                         self.on_watchdog_status(s).await;
+                        if overdue && last_overdue_stop.is_none_or(|t| t.elapsed() >= OVERDUE_STOP_RETRY) {
+                            last_overdue_stop = Some(Instant::now());
+                            self.stop_overdue().await;
+                        }
                     }
                     Err(_) => watchdog_failures += 1,
                 }
