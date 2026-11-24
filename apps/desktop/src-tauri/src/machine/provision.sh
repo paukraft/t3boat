@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Runs on a Boat sandbox, as `user`. Idempotent; also used to upgrade a machine.
-#   T3BOAT_SECRET=<watchdog-secret> provision.sh <t3-version> <sleep-after-secs> <snapshot-name> <mint-upstream-token:0|1> <name> <sandbox-id>
+# Runs on a Boat sandbox, as `user`. Idempotent; also used to upgrade a machine. A version of `-`
+# upgrades a running machine live: T3 is left as it runs, neither installed nor restarted.
+#   T3BOAT_SECRET=<watchdog-secret> provision.sh <t3-version|-> <sleep-after-secs> <snapshot-name> <mint-upstream-token:0|1> <name> <sandbox-id>
 # Expects watchdog.mjs next to it. Prints one JSON line: {"environmentId", "upstreamToken"?}.
 set -euo pipefail
 
@@ -15,9 +16,12 @@ chmod 700 "$boat_dir"
 
 # T3 server pinned to the desktop app's version, as a systemd service that survives resumes.
 # It is restarted only when something it runs on changed: a restart drops every T3 Code
-# connection, and most upgrades only touch the watchdog.
+# connection, and most upgrades only touch the watchdog. Live, what it reads below takes effect
+# at its next start.
+live=0
+[ "$version" != - ] || live=1
 restart_t3=0
-if [ "$("$t3" --version 2>/dev/null || true)" != "t3 v$version" ]; then
+if [ "$live" = 0 ] && [ "$("$t3" --version 2>/dev/null || true)" != "t3 v$version" ]; then
   if ! curl -fsSL https://t3.codes/install.sh | T3CODE_VERSION="$version" sh >"$boat_dir/install.log" 2>&1; then
     echo "T3 install failed" >&2
     tail -n 40 "$boat_dir/install.log" >&2
@@ -41,10 +45,12 @@ if [ "$(cat /etc/machine-info 2>/dev/null || true)" != "$machine_info" ]; then
   echo "$machine_info" | sudo tee /etc/machine-info >/dev/null
   restart_t3=1
 fi
-"$t3" service install --allow-downgrade >/dev/null
-systemctl --user daemon-reload
-systemctl --user is-active --quiet t3code.service || restart_t3=1
-[ "$restart_t3" = 0 ] || systemctl --user restart t3code.service
+if [ "$live" = 0 ]; then
+  "$t3" service install --allow-downgrade >/dev/null
+  systemctl --user daemon-reload
+  systemctl --user is-active --quiet t3code.service || restart_t3=1
+  [ "$restart_t3" = 0 ] || systemctl --user restart t3code.service
+fi
 
 ready=0
 for _ in $(seq 1 120); do

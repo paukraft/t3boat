@@ -44,8 +44,9 @@ const config = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 
 /**
- * draining: the manifest is published, waiting for the app's ack or the grace period. saving: this
- * watchdog saves the snapshot after an unacked drain, manifest still published.
+ * draining: the manifest is published, waiting for the app's ack or the grace period, or after a
+ * failed stop for the app's stop or its own retry. saving: this watchdog saves the snapshot after
+ * an unacked drain, manifest still published.
  * @type {"active" | "draining" | "saving" | "stopping"}
  */
 let phase = "active";
@@ -124,6 +125,12 @@ let snapshotCovered = false;
 let saveRunning = false;
 let lastTickAt = Date.now();
 let stopRequestedAt = 0;
+/** This watchdog's own last stop: within sleepAfterSecs of it the app gets the first try. */
+let selfStopAt = 0;
+/** Its last stop failed, and nobody used it since: it drains on, manifest kept, and retries. */
+let stopFailed = false;
+/** The latest tick found it idle right after a failed stop: the laptop app stops it. */
+let sleepBroken = false;
 /** "Keep awake": no sleeping before this (ms since epoch), working or not; Infinity = until stopped. */
 // A stop ends any hold: after a cold resume (new boot) the stored one is void. A warm resume
 // keeps the boot, so the resume check in tick() ends it there.
@@ -416,6 +423,7 @@ function drain() {
 /** Someone uses the machine: it stays up, and CPU load may hold it up again. */
 function touch(reason) {
   lastUsedAt = Date.now();
+  stopFailed = false;
   hold(reason);
 }
 
@@ -427,6 +435,7 @@ function hold(reason) {
   phase = "active";
   manifest = null;
   snapshotCovered = false;
+  sleepBroken = false;
 }
 
 /** Runs the Boat CLI, in a login shell for its PATH. */
@@ -438,14 +447,32 @@ function boat(args, timeout) {
   });
 }
 
-function stopSelf() {
+/** Use is turned away from here on; still running STOP_SETTLE_MS later, the stop failed. */
+function markStopping(how) {
   phase = "stopping";
   stopRequestedAt = Date.now();
-  log("stopping sandbox");
-  boat(["stop", config.sandbox]).catch((e) => {
+  sleepBroken = false;
+  log(how);
+}
+
+function stopSelf() {
+  markStopping("stopping sandbox");
+  selfStopAt = stopRequestedAt;
+  const started = stopRequestedAt;
+  boat(["stop", config.sandbox], STOP_SETTLE_MS).catch((e) => {
     log("boat stop failed", e.message);
-    hold("stop failed");
+    // An error from an older attempt (one a warm resume woke) says nothing about this machine.
+    if (phase === "stopping" && stopRequestedAt === started) stopFailedNow();
   });
+}
+
+/**
+ * Not use, so no hold(): it drains on with its manifest, which keeps the laptop app's capture
+ * confirmed, and the next tick that finds it idle reports its sleep broken (see finishDrain).
+ */
+function stopFailedNow() {
+  stopFailed = true;
+  phase = "draining";
 }
 
 async function tick() {
@@ -458,12 +485,14 @@ async function tick() {
   }
   lastTickAt = now;
   if (phase === "stopping") {
-    if (now - stopRequestedAt > STOP_SETTLE_MS) hold("still running after stop");
+    if (now - stopRequestedAt > STOP_SETTLE_MS) stopFailedNow();
     return;
   }
 
   sampleCpu();
   await refreshWorking();
+  // The app was granted a stop during the check: it wins, and the event cursor stays for a retry.
+  if (phase === "stopping") return;
   let personActed = false;
   try {
     personActed = readT3State();
@@ -480,8 +509,8 @@ async function tick() {
 
   const idleMs = now - lastActivityAt;
   if (phase === "active" && idleMs >= config.sleepAfterSecs * 1000) drain();
-  // Only here, past every check above, does a drain end in a stop. Not while a save of its own
-  // runs: one called off could finish after the app's.
+  // Only here, past every check above, or on /overdue-stop's own fresh check, does a drain end in
+  // a stop. Not while a save of its own runs: one called off could finish after the app's.
   else if (
     phase === "draining" &&
     drainStartedAt === drainBefore &&
@@ -503,6 +532,10 @@ function newEvents() {
 /** Stops once the snapshot is seen to, else saves it first. */
 function finishDrain() {
   if (newEvents()) return touch("new events");
+  // Right after a failed stop the laptop app stops it. Later, or with no app to, it retries:
+  // counted from its own stop, so the app's retries can't put that off.
+  sleepBroken = stopFailed && Date.now() - selfStopAt < config.sleepAfterSecs * 1000;
+  if (sleepBroken) return;
   if (snapshotCovered) stopSelf();
   // Not awaited: ticks go on during a save, so an agent starting to work calls it off.
   else save();
@@ -521,9 +554,10 @@ function status() {
     keepAwakeForever: keepAwakeUntil === Infinity,
     keepAwakeSecs: Number.isFinite(keepAwakeUntil) ? Math.max(0, Math.ceil((keepAwakeUntil - Date.now()) / 1000)) : 0,
     idleSecs: Math.floor((Date.now() - lastActivityAt) / 1000),
-    // Since a person or an agent last used it; a failed stop doesn't count. The laptop app stops
-    // a machine left running unused for long past its sleep delay.
-    unusedSecs: Math.floor((Date.now() - lastUsedAt) / 1000),
+    // Its own stop failed and it is still idle: the laptop app stops it.
+    sleepBroken,
+    // A snapshot save still runs, maybe called off: restarting this watchdog would kill it.
+    saving: saveRunning,
     sleepAfterSecs: config.sleepAfterSecs,
     nextDueAt,
     workDue: dueSoon(),
@@ -603,6 +637,32 @@ const server = createServer(async (req, res) => {
       // the grace period. The next tick decides the stop, after its usual checks.
       const { sequence } = JSON.parse((await readBody(req)) || "{}");
       if (phase === "draining" && manifest && sequence === manifest.sequence) snapshotCovered = true;
+      return reply(200, status());
+    }
+    if (req.method === "POST" && req.url === "/overdue-stop") {
+      // The app stops a machine whose own stop failed, but only on this fresh check: use since the
+      // tick that found it idle wins. 200 says go; the app's stop then settles like this
+      // watchdog's own.
+      const { failed } = JSON.parse((await readBody(req)) || "{}");
+      // The app's stop failed: drains on as after its own; the watchdog retries once its window ends.
+      if (failed) {
+        // Only the app's own stop: a report that comes late must not call off this watchdog's retry.
+        if (phase === "stopping" && stopRequestedAt !== selfStopAt) stopFailedNow();
+        return reply(200, status());
+      }
+      const notNow = () => reply(409, { error: "not now", ...status() });
+      if (!sleepBroken) return notNow();
+      await refreshWorking();
+      // A tick may have stopped or held it meanwhile.
+      if (!sleepBroken) return notNow();
+      // Refreshes nextDueAt, and moves the event cursor: a person's event is handled here.
+      let personActed = false;
+      try {
+        personActed = readT3State();
+      } catch {}
+      if (personActed) touch("used in T3");
+      if (!sleepBroken || isBusy() || dueSoon() || newEvents()) return notNow();
+      markStopping("stopping sandbox from the app");
       return reply(200, status());
     }
     reply(404, { error: "not found" });

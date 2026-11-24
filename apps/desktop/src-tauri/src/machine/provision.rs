@@ -13,7 +13,8 @@ const WATCHDOG_MJS: &str = include_str!("watchdog.mjs");
 const T3_PORT: u16 = 3773;
 const WATCHDOG_PORT: u16 = 3774;
 
-/// Identifies the provisioning scripts; a machine provisioned with others gets them on wake.
+/// Identifies the provisioning scripts; a machine provisioned with others gets them on wake, or
+/// in place while it runs.
 pub fn revision() -> String {
     let hash = fnv1a(PROVISION_SH.bytes().chain(WATCHDOG_MJS.bytes()).chain(SLEEP_AFTER_SECS.to_string().bytes()));
     format!("{hash:016x}")
@@ -69,12 +70,12 @@ pub fn snapshot_name(name: &str, machine_id: &str) -> String {
 }
 
 /// Copies the scripts over as a file (the watchdog secret must not appear in any command line)
-/// and runs `provision.sh`.
+/// and runs `provision.sh`. No T3 version: T3 is left as it runs, neither installed nor restarted.
 pub async fn run(
     boat: &Boat,
     sandbox_id: &str,
     name: &str,
-    t3_version: &str,
+    t3_version: Option<&str>,
     watchdog_secret: &str,
     snapshot: &str,
     mint_upstream_token: bool,
@@ -86,7 +87,7 @@ pub async fn run(
          T3BOAT_SECRET={s} bash \"$d/provision.sh\" {v} {sleep} {snapshot} {mint} {name} {sandbox}\n",
         p = b64(PROVISION_SH),
         w = b64(WATCHDOG_MJS),
-        v = shell_word(t3_version)?,
+        v = shell_word(t3_version.unwrap_or("-"))?,
         s = shell_word(watchdog_secret)?,
         sleep = SLEEP_AFTER_SECS,
         snapshot = shell_word(snapshot)?,
@@ -144,7 +145,7 @@ pub async fn create(
     created(&id);
     progress("Installing T3 Code");
     let secret = random_token();
-    let provisioned = run(boat, &id, name, t3_version, &secret, &snapshot_name(name, &id), true).await?;
+    let provisioned = run(boat, &id, name, Some(t3_version), &secret, &snapshot_name(name, &id), true).await?;
     progress("Opening the machine's address");
     let (upstream_url, watchdog_url) = host(boat, &id).await?;
     Ok(Machine {

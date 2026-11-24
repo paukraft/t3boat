@@ -53,7 +53,7 @@ pub(super) async fn socket(m: Arc<MachineRuntime>, upgrade: WebSocketUpgrade, pa
         return unauthorized();
     };
     if m.power() != Power::Running
-        && let Err(res) = wake(&m, wakes).await
+        && let Err(res) = wake(&m, wakes, &target).await
     {
         return res;
     }

@@ -94,10 +94,12 @@ impl MachineRuntime {
             .await
             .context("Boat deleted this machine's disk after 14 days asleep, and restoring its snapshot failed")?;
         // The snapshot can predate the last upgrade and the stored chats: clearing the version
-        // makes the wake re-provision and drop them.
+        // makes the wake re-provision and drop them. Its watchdog still names the old sandbox:
+        // clearing the revision too makes the run loop's live upgrade retry if the wake's fails.
         self.update_record(|m| {
             m.sandbox_id = sandbox;
             m.t3_version.clear();
+            m.provision_revision.clear();
         });
         if let Err(e) = boat.delete(&record.sandbox_id).await {
             tracing::warn!("deleting {}'s expired sandbox {}: {e:#}", record.id, record.sandbox_id);

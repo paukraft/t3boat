@@ -356,7 +356,7 @@ async fn forward(State(m): M, req: Request) -> Response {
 /// Sends the request to the machine's server and streams its answer back, unbuffered.
 async fn relay(m: &MachineRuntime, parts: Parts, body: Body, route: Relay) -> Response {
     if m.power() != Power::Running {
-        if let Err(res) = wake(m, route.wake).await {
+        if let Err(res) = wake(m, route.wake, &route.target).await {
             return res;
         }
     }
@@ -391,7 +391,7 @@ async fn relay(m: &MachineRuntime, parts: Parts, body: Body, route: Relay) -> Re
         Err(e) => e.is_connect(),
     };
     let res = if unreached && !matches!(m.refresh_power().await, Ok(Power::Running)) {
-        if let Err(res) = wake(m, route.wake).await {
+        if let Err(res) = wake(m, route.wake, &route.target).await {
             return res;
         }
         send().await
@@ -413,10 +413,12 @@ async fn relay(m: &MachineRuntime, parts: Parts, body: Body, route: Relay) -> Re
 }
 
 /// Wakes the machine for a request that may, and answers 503 for one that may not.
-async fn wake(m: &MachineRuntime, allowed: bool) -> Result<(), Response> {
+/// `why`: what woke it, logged, as every wake must be explainable.
+async fn wake(m: &MachineRuntime, allowed: bool, why: &str) -> Result<(), Response> {
     if !allowed {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
+    tracing::info!("waking {} for {why}", m.id());
     m.ensure_awake()
         .await
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response())

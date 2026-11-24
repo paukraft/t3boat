@@ -12,10 +12,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-/// Second check on a confirmed capture: Boat's stop time must follow the confirmation closely
-/// (allowing for clock skew between this computer and Boat).
+/// Second check on a confirmed capture: Boat's stop time must follow the latest confirmation
+/// closely (allowing for clock skew between this computer and Boat).
 /// The watchdog stops on its next tick after an accepted ack (5 s), after its usual checks, and
-/// gives up on a stop after 90 s. Any later stop at that sequence comes too late.
+/// gives up on a stop after 90 s. A stop retried later at that sequence counts only if this app
+/// sees it and confirms again.
 const CAPTURE_TO_STOP_MAX: chrono::TimeDelta = chrono::TimeDelta::minutes(2);
 /// Time for a capture, shell and chats. The watchdog waits 45 s into a drain for the ack before
 /// saving the snapshot itself, awake, and this app may learn of the drain 5 s late.

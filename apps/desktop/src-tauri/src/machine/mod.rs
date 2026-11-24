@@ -29,9 +29,9 @@ use tokio::sync::{mpsc, watch};
 
 const WATCHDOG_POLL: Duration = Duration::from_secs(5);
 const BOAT_POLL: Duration = Duration::from_secs(60);
-/// Unused this long past its sleep delay, the machine's own stop failed: this app stops it.
-const OVERDUE_SLEEP_SECS: u64 = 5 * 60;
 const OVERDUE_STOP_RETRY: Duration = Duration::from_secs(120);
+/// A running machine on older scripts takes this app's in place, retried this often.
+const UPGRADE_RETRY: Duration = Duration::from_secs(10 * 60);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(20);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -113,9 +113,12 @@ pub struct WatchdogStatus {
     /// Kept awake until someone stops it: no auto sleep at all.
     pub keep_awake_forever: bool,
     pub idle_secs: u64,
-    /// Since a person or an agent last used it. Older watchdogs don't say.
+    /// Its own stop failed and nothing holds it up. Older watchdogs don't say.
     #[serde(default)]
-    pub unused_secs: Option<u64>,
+    pub sleep_broken: bool,
+    /// A snapshot save still runs: a watchdog restart would kill it. Older watchdogs don't say.
+    #[serde(default)]
+    pub saving: bool,
     pub sleep_after_secs: u64,
     /// When T3 next starts work on its own, ms since epoch. Older watchdogs don't say.
     #[serde(default)]
@@ -127,18 +130,6 @@ pub struct WatchdogStatus {
     /// When this app got the status: what its second counts are relative to.
     #[serde(skip, default = "SystemTime::now")]
     pub received: SystemTime,
-}
-
-impl WatchdogStatus {
-    /// Nothing holds it up, yet it runs on long past its sleep delay: its own stop failed.
-    fn overdue_sleep(&self) -> bool {
-        let held = self.busy
-            || self.work_due
-            || self.keep_awake_forever
-            || self.keep_awake_secs > 0
-            || self.phase == WatchdogPhase::Saving;
-        !held && self.unused_secs.is_some_and(|u| u >= self.sleep_after_secs + OVERDUE_SLEEP_SECS)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -489,7 +480,7 @@ impl MachineRuntime {
             // restarting it would kill that. A restored machine booted fresh from its snapshot:
             // nothing to kill, and the upgrade drops the snapshot's stale chats.
             if !restored && self.watchdog_get("/status?fresh").await.is_ok_and(|s| s.busy || s.waiting_threads > 0) {
-                tracing::info!("{id} is busy: upgrade deferred to the next wake");
+                tracing::info!("{id} is busy: T3 upgrade deferred to the next wake");
             } else if let Err(e) = self.upgrade_if_needed().await {
                 tracing::warn!("upgrading {id}: {e:#}");
             }
@@ -544,27 +535,44 @@ impl MachineRuntime {
     /// Keeps the machine on the desktop app's T3 version and on this app's scripts.
     pub async fn upgrade_if_needed(&self) -> Result<()> {
         let desktop = self.shared.t3.version().await?;
+        self.upgrade(Some(desktop)).await
+    }
+
+    /// No T3 version: this app's scripts only, T3 neither installed nor restarted, so nobody using
+    /// it loses anything; a new T3 version waits for the next wake.
+    async fn upgrade(&self, t3_version: Option<String>) -> Result<()> {
         let revision = provision::revision();
         let record = self.record();
-        let new_server = desktop != record.t3_version;
+        let new_server = t3_version.as_ref().is_some_and(|v| *v != record.t3_version);
         if !new_server && revision == record.provision_revision {
             return Ok(());
         }
-        tracing::info!("upgrading {} (T3 {desktop}, scripts {revision})", self.id());
+        tracing::info!(
+            "upgrading {} (T3 {}, scripts {revision})",
+            self.id(),
+            t3_version.as_deref().unwrap_or("left as it runs")
+        );
         provision::run(
             &self.shared.boat,
             &record.sandbox_id,
             &record.name,
-            &desktop,
+            t3_version.as_deref(),
             &record.watchdog_secret,
             &provision::snapshot_name(&record.name, &record.id),
             false,
         )
         .await?;
+        let live = t3_version.is_none();
         self.update_record(|m| {
-            m.t3_version = desktop;
+            if let Some(v) = t3_version {
+                m.t3_version = v;
+            }
             m.provision_revision = revision;
         });
+        // T3 ran on untouched: nothing it served changed.
+        if live {
+            return Ok(());
+        }
         {
             let mut cache = self.cache.lock().unwrap();
             cache.bump_epoch();
@@ -655,7 +663,7 @@ impl MachineRuntime {
         };
         // These routes reply after the watchdog's own T3 check, which allows itself 10 s. Older
         // watchdogs check T3 inside the ack too.
-        let refreshes = matches!(path, "/status?fresh" | "/drain" | "/sleep-ack");
+        let refreshes = matches!(path, "/status?fresh" | "/drain" | "/sleep-ack" | "/overdue-stop");
         let timeout = Duration::from_secs(if refreshes { 15 } else { 4 });
         let mut req = self.shared.http.request(method, url).bearer_auth(secret).timeout(timeout);
         if let Some(body) = body {
@@ -704,16 +712,6 @@ impl MachineRuntime {
             return Ok(());
         }
         self.ensure_awake().await?;
-        // Older scripts lack keep-awake: take this app's now, which restarts T3, so never
-        // mid-turn or while an agent waits on the user. Ending a hold works with any watchdog
-        // that has one.
-        if minutes != Some(0) && self.record().provision_revision != provision::revision() {
-            let s = self.watchdog_get("/status?fresh").await?;
-            if s.busy || s.waiting_threads > 0 {
-                bail!("needs a quick update first; try again once no agent works or waits on you there");
-            }
-            self.kept_awake(self.upgrade_if_needed()).await?;
-        }
         let body = json!({ "minutes": minutes });
         let s = match self.watchdog_post("/keep-awake", body.clone()).await {
             Ok(s) => s,
@@ -832,7 +830,7 @@ impl MachineRuntime {
                 // Acked only while draining: a reply still saving would re-ack in a loop.
                 if phase == WatchdogPhase::Draining {
                     match self.watchdog_post("/sleep-ack", json!({ "sequence": m.sequence })).await {
-                        // Accepted: the watchdog now stops only on a next tick at this sequence,
+                        // Accepted: no stop inside the ack; a later tick stops it at this sequence,
                         // which a poll can miss before Boat freezes the machine. Any later use
                         // ends in a new drain, recaptured, or a stop too late for fresh_capture.
                         Ok(s) if s.phase == WatchdogPhase::Draining => {
@@ -859,31 +857,56 @@ impl MachineRuntime {
         }
     }
 
-    /// The watchdog failed to stop an unused machine: stopped from here, and the user told, as it
-    /// won't sleep while this Mac is off until that is fixed.
-    async fn stop_overdue(&self) {
-        let record = self.record();
-        tracing::warn!("{} runs unused past its sleep: stopping it from here", record.id);
-        self.mark_stopping();
-        match self.shared.boat.stop(&record.sandbox_id).await {
-            Ok(()) => self.shared.notify(
-                format!("{} didn't go to sleep on its own", record.name),
-                "t3boat put it to sleep from this Mac. Its own sleep is broken: with this Mac off it keeps running.",
-            ),
+    /// The watchdog failed to stop an unused machine: stopped from here, only once it agrees on a
+    /// fresh check, so use since its last tick wins. False: not stopped, it no longer agrees.
+    async fn stop_overdue(&self) -> Result<bool> {
+        // 200 says go. A 409 mid-stop of its own is marked as such by the request.
+        let s = match self.watchdog_post("/overdue-stop", json!({})).await {
+            Ok(s) => s,
             Err(e) => {
-                tracing::warn!("stopping {}: {e:#}", record.id);
-                self.shared.notify(format!("{} won't go to sleep", record.name), format!("{e:#}"));
+                tracing::debug!("overdue stop of {} refused: {e:#}", self.id());
+                // A 200 lost in transit leaves it stopping: hand it back. Harmless after a 409,
+                // as the watchdog only undoes a stop it granted to this app.
+                let _ = self.watchdog_post("/overdue-stop", json!({ "failed": true })).await;
+                return Ok(false);
             }
+        };
+        let record = self.record();
+        tracing::warn!("{}'s own stop failed: stopping it from here", record.id);
+        // Confirms the capture and marks the stop, as for the watchdog's own.
+        self.on_watchdog_status(s).await;
+        // Settles from now, not from the watchdog's own failed stop.
+        *self.stop_seen.lock().unwrap() = Some(Instant::now());
+        let stopped = self.shared.boat.stop(&record.sandbox_id).await;
+        if stopped.is_err() {
+            // Maybe still running: requests must not wait on a stop that isn't coming.
+            *self.stop_seen.lock().unwrap() = None;
         }
-        if let Err(e) = self.refresh_power().await {
+        let power = self.refresh_power().await;
+        if let Err(e) = &power {
             tracing::warn!("boat info {}: {e:#}", record.id);
+        }
+        match stopped {
+            // An error or a timeout can still leave the stop taken.
+            Err(e) if !matches!(power, Ok(Power::Stopping | Power::Stopped)) => {
+                // Handed back: it drains on instead of waiting out the settle, and retries itself.
+                let _ = self.watchdog_post("/overdue-stop", json!({ "failed": true })).await;
+                Err(e)
+            }
+            _ => Ok(true),
         }
     }
 
     /// Known before Boat says so: new sockets and wakes wait for the stop instead of reaching a
     /// machine that is about to freeze.
     fn mark_stopping(&self) {
-        self.stop_seen.lock().unwrap().get_or_insert_with(Instant::now);
+        {
+            // An expired one is an earlier, failed stop: this one settles from now.
+            let mut seen = self.stop_seen.lock().unwrap();
+            if !seen.is_some_and(|t| t.elapsed() < Self::STOP_SETTLE) {
+                *seen = Some(Instant::now());
+            }
+        }
         self.set_power(Power::Stopping);
     }
 
@@ -908,6 +931,11 @@ impl MachineRuntime {
         let mut last_due_wake: Option<Instant> = None;
         let mut last_link_check: Option<Instant> = None;
         let mut last_overdue_stop: Option<Instant> = None;
+        // Told the user it won't sleep: once until it is stopped.
+        let mut overdue_stop_failed = false;
+        // Told the user its own sleep is broken: once per run of this app.
+        let mut overdue_stop_told = false;
+        let mut last_upgrade: Option<Instant> = None;
         let mut watchdog_failures = 0u32;
         let mut was_busy = false;
         let mut was_running = false;
@@ -920,8 +948,11 @@ impl MachineRuntime {
                     tracing::warn!("boat info {}: {e:#}", self.id());
                 }
             }
-            if self.power() == Power::Missing {
-                return;
+            match self.power() {
+                Power::Missing => return,
+                // Asleep: a later stop failing is news again.
+                Power::Stopped => overdue_stop_failed = false,
+                _ => {}
             }
             if self.needs_keep_alive() && last_keep_alive.is_none_or(|t| t.elapsed() >= KEEP_ALIVE_RETRY) {
                 // Boat keeps a stopped disk 14 days; a short wake renews it. The watchdog
@@ -982,11 +1013,43 @@ impl MachineRuntime {
                             let this = self.clone();
                             tokio::spawn(async move { this.on_ready().await });
                         }
-                        let overdue = s.overdue_sleep();
+                        let sleep_broken = s.sleep_broken;
+                        // Otherwise only a resume upgrades it, and an older watchdog whose own stop
+                        // always fails never sleeps. Scripts only: T3 runs on under whatever works
+                        // there. Not during a save, which restarting the watchdog would kill, nor
+                        // while T3 can't be checked: a restarted one takes that for T3 starting,
+                        // not maybe mid-turn.
+                        let upgrade = s.phase == WatchdogPhase::Active
+                            && !s.saving
+                            && !s.agents_unknown
+                            && self.record().provision_revision != provision::revision();
                         self.on_watchdog_status(s).await;
-                        if overdue && last_overdue_stop.is_none_or(|t| t.elapsed() >= OVERDUE_STOP_RETRY) {
+                        if sleep_broken && last_overdue_stop.is_none_or(|t| t.elapsed() >= OVERDUE_STOP_RETRY) {
                             last_overdue_stop = Some(Instant::now());
-                            self.stop_overdue().await;
+                            match self.stop_overdue().await {
+                                Ok(false) => {}
+                                Ok(true) => {
+                                    if !std::mem::replace(&mut overdue_stop_told, true) {
+                                        self.shared.notify(
+                                            format!("{} didn't go to sleep on its own", self.record().name),
+                                            "t3boat put it to sleep from this Mac. Its own stop failed; with this Mac off it may keep running.",
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("stopping {}: {e:#}", self.id());
+                                    if !std::mem::replace(&mut overdue_stop_failed, true) {
+                                        self.shared.notify(format!("{} won't go to sleep", self.record().name), format!("{e:#}"));
+                                    }
+                                }
+                            }
+                        } else if upgrade && last_upgrade.is_none_or(|t| t.elapsed() >= UPGRADE_RETRY) {
+                            last_upgrade = Some(Instant::now());
+                            // Not kept awake: that counts as use, so an upgrade failing every
+                            // retry would never let it sleep.
+                            if let Err(e) = self.upgrade(None).await {
+                                tracing::warn!("upgrading {}: {e:#}", self.id());
+                            }
                         }
                     }
                     Err(_) => watchdog_failures += 1,

@@ -137,6 +137,7 @@ fn handshake(m: &Arc<MachineRuntime>, body: &[u8]) -> Option<Response> {
     match msg["method"].as_str()? {
         "initialize" => {
             let m = m.clone();
+            tracing::info!("waking {} for a linked T3 server", m.id());
             tokio::spawn(async move {
                 let _ = m.ensure_awake().await;
             });
