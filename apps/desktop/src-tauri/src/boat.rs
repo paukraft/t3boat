@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use crate::process::command;
 
+/// Boat's longest lifetime on a free trial, which refuses `--no-auto-stop`.
+const TRIAL_TTL_SECS: u64 = 7200;
+
 #[derive(Clone, Debug)]
 pub struct Boat {
     bin: PathBuf,
@@ -18,6 +21,17 @@ pub struct Sandbox {
     pub id: String,
     pub state: String,
     pub stopped_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When Boat stops it on its own; none without a lifetime or while stopped.
+    pub archive_after: Option<chrono::DateTime<chrono::Utc>>,
+    pub ttl_seconds: Option<u64>,
+}
+
+impl Sandbox {
+    /// When Boat stops it on its own, for a trial lifetime this app set. One the user set
+    /// themselves is theirs to keep.
+    pub fn trial_deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.archive_after.filter(|_| self.ttl_seconds == Some(TRIAL_TTL_SECS))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -103,6 +117,16 @@ impl Boat {
         ))
     }
 
+    /// Free-trial accounts refuse `--no-auto-stop`; they get Boat's longest trial lifetime instead.
+    async fn output_without_auto_stop(&self, args: &[&str], timeout: Duration) -> Result<(bool, String, String)> {
+        let (ok, stdout, stderr) = self.output(&[args, &["--no-auto-stop"]].concat(), timeout).await?;
+        if ok || !said(&stdout, &stderr).contains("trial_auto_stop_required") {
+            return Ok((ok, stdout, stderr));
+        }
+        let ttl = TRIAL_TTL_SECS.to_string();
+        self.output(&[args, &["--ttl", &ttl]].concat(), timeout).await
+    }
+
     async fn run(&self, args: &[&str], timeout: Duration) -> Result<String> {
         let (ok, stdout, stderr) = self.output(args, timeout).await?;
         if !ok {
@@ -129,10 +153,13 @@ impl Boat {
 
     /// Returns the new sandbox's id. `snapshot`: the saved snapshot its disk starts from.
     pub async fn create(&self, name: &str, size: &str, snapshot: Option<&str>) -> Result<String> {
-        let mut args = vec!["new", "--name", name, "--type", size, "--no-auto-stop"];
+        let mut args = vec!["new", "--name", name, "--type", size];
         args.extend(snapshot.into_iter().flat_map(|s| ["--from", s]));
-        let out = self.run(&args, Duration::from_secs(300)).await?;
-        let v = Self::last_json(&out)?;
+        let (ok, stdout, stderr) = self.output_without_auto_stop(&args, Duration::from_secs(300)).await?;
+        if !ok {
+            bail!("boat new failed: {}", said(&stdout, &stderr));
+        }
+        let v = Self::last_json(&stdout)?;
         let id = v["id"].as_str().ok_or_else(|| anyhow!("boat new returned no id"))?;
         Ok(id.to_owned())
     }
@@ -155,7 +182,7 @@ impl Boat {
     /// Resumes onto `size`, which is how a machine changes size.
     pub async fn resume(&self, id: &str, size: &str) -> Result<Resume> {
         let (ok, stdout, stderr) =
-            self.output(&["resume", id, "--no-auto-stop", "--type", size], Duration::from_secs(300)).await?;
+            self.output_without_auto_stop(&["resume", id, "--type", size], Duration::from_secs(300)).await?;
         let said = said(&stdout, &stderr);
         match ok {
             true => Ok(Resume::Resumed),
@@ -188,6 +215,13 @@ impl Boat {
     /// Stops and snapshots it for resume; returns once Boat took the stop.
     pub async fn stop(&self, id: &str) -> Result<()> {
         self.run(&["stop", id], Duration::from_secs(60)).await.map(drop)
+    }
+
+    /// Resets a trial sandbox's lifetime to the longest. Only from here: the sandbox's own key
+    /// can't extend it.
+    pub async fn extend_trial(&self, id: &str) -> Result<()> {
+        let ttl = TRIAL_TTL_SECS.to_string();
+        self.run(&["extend", id, "--ttl", &ttl], Duration::from_secs(20)).await.map(drop)
     }
 
     pub async fn delete(&self, id: &str) -> Result<()> {
@@ -308,4 +342,85 @@ fn said<'a>(stdout: &'a str, stderr: &'a str) -> &'a str {
 /// Command-line form of a path; the Boat CLI and git only take UTF-8 here.
 pub(crate) fn path_str(path: &Path) -> Result<&str> {
     path.to_str().ok_or_else(|| anyhow!("path is not UTF-8: {}", path.display()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{Boat, Resume, Sandbox};
+    use std::os::unix::fs::PermissionsExt;
+
+    const TRIAL_BOAT: &str = r#"#!/bin/sh
+d=$(dirname "$0"); shift
+echo "$*" >> "$d/log"
+case " $* " in
+  *" --no-auto-stop "*) [ -f "$d/trial" ] || [ -f "$d/down" ] || { echo '{"id":"bx_new"}'; exit 0; }
+    [ -f "$d/down" ] && { echo 'Boat is down' >&2; exit 1; }
+    echo '{"code":"trial_auto_stop_required","error":"Set a TTL of 2 hours or less"}' >&2; exit 1 ;;
+  *" --ttl 7200 "*) echo '{"id":"bx_new"}' ;;
+  *) exit 1 ;;
+esac
+"#;
+
+    fn fake_boat(name: &str, flag: Option<&str>) -> (Boat, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("t3boat-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("boat");
+        std::fs::write(&bin, TRIAL_BOAT).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if let Some(flag) = flag {
+            std::fs::write(dir.join(flag), "").unwrap();
+        }
+        (Boat::at(bin), dir)
+    }
+
+    fn calls(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("log")).unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
+    #[tokio::test]
+    async fn trial_accounts_get_the_longest_ttl_instead_of_no_auto_stop() {
+        let (boat, dir) = fake_boat("trial", Some("trial"));
+        assert_eq!(boat.create("m", "default", None).await.unwrap(), "bx_new");
+        assert_eq!(boat.resume("bx_new", "small").await.unwrap(), Resume::Resumed);
+        assert_eq!(
+            calls(&dir),
+            [
+                "new --name m --type default --no-auto-stop",
+                "new --name m --type default --ttl 7200",
+                "resume bx_new --type small --no-auto-stop",
+                "resume bx_new --type small --ttl 7200",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn paid_accounts_and_other_failures_never_fall_back_to_a_ttl() {
+        let (paid, dir) = fake_boat("paid", None);
+        assert_eq!(paid.create("m", "large", None).await.unwrap(), "bx_new");
+        assert_eq!(calls(&dir), ["new --name m --type large --no-auto-stop"]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (down, dir) = fake_boat("down", Some("down"));
+        let err = down.create("m", "default", None).await.unwrap_err().to_string();
+        assert!(err.contains("Boat is down"), "{err}");
+        assert_eq!(calls(&dir), ["new --name m --type default --no-auto-stop"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_trial_lifetime_this_app_sets_is_renewed() {
+        let ends = "2026-11-24T12:00:00Z".parse().unwrap();
+        let sandbox = |ttl_seconds| Sandbox {
+            id: "bx_1".into(),
+            state: "running".into(),
+            stopped_at: None,
+            archive_after: Some(ends),
+            ttl_seconds,
+        };
+        assert_eq!(sandbox(Some(7200)).trial_deadline(), Some(ends));
+        assert_eq!(sandbox(None).trial_deadline(), None);
+        assert_eq!(sandbox(Some(3600)).trial_deadline(), None);
+    }
 }

@@ -50,6 +50,8 @@ const DUE_WAKE_RETRY: Duration = Duration::from_secs(5 * 60);
 /// A running machine's link is checked this often: links can be turned on, fail or near expiry
 /// while it stays up.
 const LINK_CHECK: Duration = Duration::from_secs(10 * 60);
+/// A running trial machine's lifetime is pushed back once this close to its end.
+const TRIAL_RENEW_LEAD: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Power {
@@ -173,6 +175,8 @@ pub struct MachineRuntime {
     pub auth: Auth,
     power: watch::Sender<Power>,
     stopped_at: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    /// When Boat stops a trial machine on its own (`Sandbox::trial_deadline`).
+    lifetime_ends: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     watchdog: Mutex<Option<WatchdogStatus>>,
     /// One wake at a time; a delete takes it too, so no restore swaps the sandbox under it.
     pub(crate) waking: tokio::sync::Mutex<()>,
@@ -203,6 +207,7 @@ impl MachineRuntime {
             auth: Auth::default(),
             power: watch::channel(Power::Unknown).0,
             stopped_at: Mutex::new(None),
+            lifetime_ends: Mutex::new(None),
             watchdog: Mutex::new(None),
             waking: tokio::sync::Mutex::new(()),
             capturing: tokio::sync::Mutex::new(()),
@@ -319,6 +324,7 @@ impl MachineRuntime {
                     return Ok(self.power());
                 }
                 *self.stopped_at.lock().unwrap() = sb.stopped_at;
+                *self.lifetime_ends.lock().unwrap() = sb.trial_deadline();
                 let mut p = Power::from_sandbox(&sb);
                 if p == Power::Stopped {
                     *self.stop_seen.lock().unwrap() = None;
@@ -943,9 +949,22 @@ impl MachineRuntime {
             let transitioning = matches!(self.power(), Power::Stopping | Power::Starting | Power::Unknown);
             if transitioning || last_boat_poll.is_none_or(|t| t.elapsed() >= BOAT_POLL) || watchdog_failures >= 2 {
                 last_boat_poll = Some(Instant::now());
+                let watchdog_known = watchdog_failures == 0;
                 watchdog_failures = 0;
-                if let Err(e) = self.refresh_power().await {
-                    tracing::warn!("boat info {}: {e:#}", self.id());
+                match self.refresh_power().await {
+                    // Boat would stop it at its end, mid-turn or not; the sandbox's own key can't
+                    // extend it, so this app does. Not once it is going to sleep; an unreachable
+                    // watchdog counts as unknown. Retried each poll until it moves.
+                    Ok(Power::Running)
+                        if self.lifetime_ends.lock().unwrap().is_some_and(|t| t - chrono::Utc::now() <= TRIAL_RENEW_LEAD)
+                            && (!watchdog_known || self.watchdog_status().is_none_or(|w| w.phase == WatchdogPhase::Active)) =>
+                    {
+                        if let Err(e) = self.shared.boat.extend_trial(&self.sandbox_id()).await {
+                            tracing::warn!("boat extend {}: {e:#}", self.id());
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("boat info {}: {e:#}", self.id()),
                 }
             }
             match self.power() {
