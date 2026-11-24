@@ -112,6 +112,22 @@ impl Boat {
         Ok(stdout)
     }
 
+    async fn output_with_auto_stop_fallback(&self, mut args: Vec<&str>) -> Result<(bool, String, String)> {
+        let timeout = Duration::from_secs(300);
+        args.push("--no-auto-stop");
+        let result = self.output(&args, timeout).await?;
+        let (ok, stdout, stderr) = &result;
+        let trial_rejected = [stdout, stderr].iter().any(|stream| {
+            Self::last_json(stream).is_ok_and(|error| error["code"] == "trial_auto_stop_required")
+        });
+        if !ok && trial_rejected {
+            args.pop();
+            args.extend(["--ttl", "7200"]);
+            return self.output(&args, timeout).await;
+        }
+        Ok(result)
+    }
+
     /// The CLI prints JSON lines for long operations; the last line is the result.
     fn last_json(out: &str) -> Result<Value> {
         let line = out
@@ -129,10 +145,13 @@ impl Boat {
 
     /// Returns the new sandbox's id. `snapshot`: the saved snapshot its disk starts from.
     pub async fn create(&self, name: &str, size: &str, snapshot: Option<&str>) -> Result<String> {
-        let mut args = vec!["new", "--name", name, "--type", size, "--no-auto-stop"];
+        let mut args = vec!["new", "--name", name, "--type", size];
         args.extend(snapshot.into_iter().flat_map(|s| ["--from", s]));
-        let out = self.run(&args, Duration::from_secs(300)).await?;
-        let v = Self::last_json(&out)?;
+        let (ok, stdout, stderr) = self.output_with_auto_stop_fallback(args).await?;
+        if !ok {
+            bail!("boat new failed: {}", said(&stdout, &stderr));
+        }
+        let v = Self::last_json(&stdout)?;
         let id = v["id"].as_str().ok_or_else(|| anyhow!("boat new returned no id"))?;
         Ok(id.to_owned())
     }
@@ -154,8 +173,7 @@ impl Boat {
 
     /// Resumes onto `size`, which is how a machine changes size.
     pub async fn resume(&self, id: &str, size: &str) -> Result<Resume> {
-        let (ok, stdout, stderr) =
-            self.output(&["resume", id, "--no-auto-stop", "--type", size], Duration::from_secs(300)).await?;
+        let (ok, stdout, stderr) = self.output_with_auto_stop_fallback(vec!["resume", id, "--type", size]).await?;
         let said = said(&stdout, &stderr);
         match ok {
             true => Ok(Resume::Resumed),
@@ -303,4 +321,45 @@ fn said<'a>(stdout: &'a str, stderr: &'a str) -> &'a str {
 /// Command-line form of a path; the Boat CLI and git only take UTF-8 here.
 pub(crate) fn path_str(path: &Path) -> Result<&str> {
     path.to_str().ok_or_else(|| anyhow!("path is not UTF-8: {}", path.display()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[tokio::test]
+    async fn retries_create_and_resume_when_trial_requires_auto_stop() {
+        let dir = std::env::temp_dir().join(format!("t3boat-trial-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("boat");
+        fs::write(
+            &bin,
+            r#"#!/bin/sh
+case "$*" in
+  "--json new --name trial --type small --from base --no-auto-stop")
+    echo '{"code":"trial_auto_stop_required"}' >&2; exit 1 ;;
+  "--json resume bx_trial --type small --no-auto-stop")
+    echo '{"code":"trial_auto_stop_required"}'; exit 1 ;;
+  "--json new --name trial --type small --from base --ttl 7200" | "--json resume bx_trial --type small --ttl 7200")
+    echo '{"id":"bx_trial"}' ;;
+  "--json new --name blocked --type small --no-auto-stop")
+    echo '{"code":"billing_required"}' >&2; exit 1 ;;
+  *) echo "unexpected arguments: $*" >&2; exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let boat = Boat::at(bin);
+
+        let created = boat.create("trial", "small", Some("base")).await;
+        let resumed = boat.resume("bx_trial", "small").await;
+        let blocked = boat.create("blocked", "small", None).await;
+        fs::remove_dir_all(dir).unwrap();
+
+        assert_eq!(created.unwrap(), "bx_trial");
+        assert!(matches!(resumed.unwrap(), Resume::Resumed));
+        assert!(blocked.unwrap_err().to_string().contains("billing_required"));
+    }
 }
