@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import type { McpClient, Settings, UiState } from "../types";
 import { AgentName, AgentNames } from "./AgentLogos";
 import { Icon } from "./Icons";
@@ -12,7 +12,8 @@ const CLIENTS: { id: McpClient; name: string }[] = [
 
 interface Props {
   state: UiState;
-  onSave: (s: Settings) => void;
+  /** rejects once the caller showed the error */
+  onSave: (s: Settings) => Promise<void>;
   /** never rejects; errors are shown by the caller */
   onAddMcp: (client: McpClient) => Promise<void>;
   onQuit: () => void;
@@ -20,9 +21,9 @@ interface Props {
 }
 
 export function SettingsView({ state, onSave, onAddMcp, onQuit, onBack }: Props) {
-  // optimistic copy; the next "state" event is the source of truth
-  const [s, setS] = useState(state.settings);
-  useEffect(() => setS(state.settings), [state.settings]);
+  // optimistic while saving; the backend sends the new state before the save resolves
+  const [saving, setSaving] = useState<Settings | null>(null);
+  const s = saving ?? state.settings;
 
   // hidden by default so screen recordings don't leak the email
   const [showEmail, setShowEmail] = useState(false);
@@ -38,8 +39,10 @@ export function SettingsView({ state, onSave, onAddMcp, onQuit, onBack }: Props)
 
   const change = (p: Partial<Settings>) => {
     const next = { ...s, ...p };
-    setS(next);
-    onSave(next);
+    setSaving(next);
+    // either way the props now hold the latest confirmed settings
+    const done = () => setSaving(null);
+    onSave(next).then(done, done);
   };
 
   return (
@@ -56,6 +59,7 @@ export function SettingsView({ state, onSave, onAddMcp, onQuit, onBack }: Props)
             role="switch"
             className="switch"
             checked={s.startAtLogin}
+            disabled={saving !== null}
             onChange={(e) => change({ startAtLogin: e.target.checked })}
           />
         </label>

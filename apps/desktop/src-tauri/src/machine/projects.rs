@@ -13,7 +13,7 @@ use std::time::Duration;
 /// Long enough for a large repository on a slow link.
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineProject {
     /// T3's project id on the machine; while t3boat adds it, the local project's id.

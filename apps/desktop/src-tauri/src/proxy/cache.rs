@@ -235,8 +235,9 @@ impl Cache {
             .for_each(|(_, r)| record_config_event(&mut r.value, &event));
     }
 
-    /// The machine's enabled agent providers, per its last config: name and auth status.
-    pub fn agents(&self) -> Vec<(String, String)> {
+    /// The machine's enabled agent providers whose sign-in is known, per its last config: name
+    /// and whether signed in.
+    pub fn agents(&self) -> Vec<(String, bool)> {
         self.streams
             .iter()
             .filter(|(k, _)| k.starts_with("subscribeServerConfig "))
@@ -247,17 +248,14 @@ impl Cache {
             .flatten()
             .filter(|p| p["enabled"] == true)
             .filter_map(|p| {
-                Some((
-                    p["displayName"].as_str()?.to_owned(),
-                    p["auth"]["status"].as_str().unwrap_or("unknown").to_owned(),
-                ))
+                let signed_in = match p["auth"]["status"].as_str()? {
+                    "authenticated" => true,
+                    "unauthenticated" => false,
+                    _ => return None,
+                };
+                Some((p["displayName"].as_str()?.to_owned(), signed_in))
             })
             .collect()
-    }
-
-    /// Enabled agents that are not signed in.
-    pub fn signed_out_providers(&self) -> Vec<String> {
-        self.agents().into_iter().filter(|(_, s)| s == "unauthenticated").map(|(n, _)| n).collect()
     }
 }
 
@@ -447,7 +445,7 @@ mod tests {
         let providers = &items[0]["config"]["providers"];
         assert_eq!(providers[0]["models"], json!([1]));
         assert_eq!(providers[1]["instanceId"], "b");
-        assert_eq!(c.signed_out_providers(), vec!["a".to_owned()]);
+        assert_eq!(c.agents(), vec![("a".to_owned(), false), ("b".to_owned(), true)]);
     }
 
     #[test]
@@ -457,9 +455,9 @@ mod tests {
             json!({"type": "snapshot", "config": {"providers": [provider("a", "unauthenticated", json!([]))]}});
         c.record_stream_items("subscribeServerConfig", CONFIG, &[snapshot], true);
         c.fold_providers(&Value::Null);
-        assert_eq!(c.signed_out_providers(), vec!["a".to_owned()]);
+        assert_eq!(c.agents(), vec![("a".to_owned(), false)]);
         c.fold_providers(&json!([provider("a", "authenticated", json!([]))]));
-        assert!(c.signed_out_providers().is_empty());
+        assert_eq!(c.agents(), vec![("a".to_owned(), true)]);
     }
 
     #[test]

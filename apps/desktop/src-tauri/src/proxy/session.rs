@@ -49,10 +49,12 @@ struct Forwarded {
 
 enum Internal {
     Settled(Power),
+    /// It runs, but T3 did not take the messages accepted while it slept.
+    Undelivered,
     Woke(Result<()>),
     Connected(Result<upstream::Upstream>),
-    /// Connecting failed; the machine's power when checked after.
-    ConnectFailed(Power),
+    /// T3 was not reached (`unreached`); the machine's power when checked after.
+    Unreached(Power),
     Up(Option<String>),
     /// The upstream socket is gone; the machine's power when checked after.
     UpstreamLost(Power),
@@ -174,12 +176,21 @@ impl Session {
         }
     }
 
-    /// Learns whether the machine runs without blocking this socket's loop.
-    fn settle(&self) {
+    /// Learns whether the machine runs without blocking this socket's loop, holding requests
+    /// meanwhile. Running once the messages accepted while it slept went up: nothing this socket
+    /// sends may overtake them.
+    fn settle(&mut self) {
+        self.phase = Phase::Settling;
         let m = self.m.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(Internal::Settled(m.settled_power().await));
+            let power = m.settled_power().await;
+            let ev = if power == Power::Running && !m.flush_deferred_commands().await {
+                Internal::Undelivered
+            } else {
+                Internal::Settled(power)
+            };
+            let _ = tx.send(ev);
         });
     }
 
@@ -375,7 +386,7 @@ impl Session {
         let m = self.m.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(Internal::Woke(m.ensure_awake(&why).await));
+            let _ = tx.send(Internal::Woke(m.wake_for_request(&why).await));
         });
     }
 
@@ -394,7 +405,6 @@ impl Session {
 
     fn connect(&mut self) {
         self.phase = Phase::Connecting;
-        self.connect_attempts += 1;
         let (url, token, query) = (self.m.upstream_url(), self.m.upstream_token(), self.query.clone());
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -414,21 +424,25 @@ impl Session {
         if self.held.is_empty() && !self.cached.is_empty() {
             return Ok(Some("machine woke".into()));
         }
-        self.connect();
+        self.settle();
         Ok(None)
     }
 
     async fn on_internal(&mut self, ev: Internal) -> Step {
         match ev {
-            Internal::Settled(Power::Running) => self.connect(),
+            // Boat may have reported it stopped during the flush.
+            Internal::Settled(Power::Running) if self.m.power() == Power::Running => self.connect(),
             Internal::Settled(_) => self.go_asleep().await?,
-            Internal::Woke(Ok(())) => self.connect(),
+            Internal::Undelivered => return Ok(self.unreached()),
+            Internal::Woke(Ok(())) => self.settle(),
             Internal::Woke(Err(e)) => {
-                let msg = format!("The machine could not wake: {e:#}");
+                let msg = format!("The machine could not wake: {}", crate::boat::plain(&e));
                 for req in std::mem::take(&mut self.held) {
                     self.send(&exit_die(&req["id"], &msg)).await?;
                 }
                 self.phase = Phase::Asleep;
+                // T3 may answer by now, and its Running came while this socket was waking.
+                return self.on_power(self.m.power());
             }
             Internal::Connected(Ok(ws)) => {
                 self.connect_attempts = 0;
@@ -438,26 +452,36 @@ impl Session {
             }
             Internal::Connected(Err(e)) => {
                 tracing::warn!("upstream connect for {}: {e:#}", self.m.id());
-                if self.connect_attempts >= MAX_CONNECT_ATTEMPTS {
-                    return Ok(Some("machine unreachable".into()));
-                }
-                self.recheck_power(Internal::ConnectFailed);
+                return Ok(self.unreached());
             }
             // Not ready yet, or Boat moved its address: a wake sorts out both, and returns at
             // once if neither.
-            Internal::ConnectFailed(Power::Running) => self.wake("a T3 Code connection".into()),
+            Internal::Unreached(Power::Running) => self.wake("a T3 Code connection".into()),
             // Boat didn't answer either: T3 Code reconnects, and the new session looks again.
             // Taken for asleep, it would answer from the cache while the machine runs.
-            Internal::ConnectFailed(Power::Unknown) => return Ok(Some("machine unreachable".into())),
+            Internal::Unreached(Power::Unknown) => return Ok(Some("machine unreachable".into())),
+            // Running again by now, its update come while this settled: settled anew.
+            Internal::Unreached(_) if self.m.power() == Power::Running => self.settle(),
             // Asleep after all, maybe stopping when last seen running: only what is held may
             // wake it.
-            Internal::ConnectFailed(_) => self.go_asleep().await?,
+            Internal::Unreached(_) => self.go_asleep().await?,
             Internal::Up(Some(text)) => return self.on_up(&text).await,
             Internal::Up(None) => return self.on_upstream_lost().await,
             Internal::UpstreamLost(power) => return self.after_upstream_lost(power).await,
             Internal::CloseNow => return Ok(Some("machine woke".into())),
         }
         Ok(None)
+    }
+
+    /// Connecting to T3 failed, or it did not take the messages accepted while the machine slept:
+    /// counted, then Boat says how the machine is. It may have stopped since last seen running.
+    fn unreached(&mut self) -> Option<String> {
+        self.connect_attempts += 1;
+        if self.connect_attempts >= MAX_CONNECT_ATTEMPTS {
+            return Some("machine unreachable".into());
+        }
+        self.recheck_power(Internal::Unreached);
+        None
     }
 
     /// The machine sleeps: what was held meanwhile is handled like any request to it.

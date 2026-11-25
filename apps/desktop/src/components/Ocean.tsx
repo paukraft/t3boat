@@ -94,7 +94,7 @@ export function Ocean({ boats, active, compact, onPick, children }: Props) {
           <div className="ocean-tags" aria-hidden>
             {boats.map((b) => {
               const isActive = active === b.key;
-              if (!showAllTags && !isActive && b.state !== "error") return null;
+              if (!showAllTags && !isActive) return null;
               return (
                 <span
                   key={b.key}

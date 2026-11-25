@@ -22,6 +22,13 @@ const PORTS: u16 = 1000;
 const REAP_RETRY: Duration = Duration::from_secs(60);
 /// Pending this long since this launch first tried it: the user is told, and it is tried on.
 const REAP_WARN: Duration = Duration::from_secs(15 * 60);
+/// Every machine's power is read from one `boat list` this often, or sooner after a failed one.
+const BOAT_POLL: Duration = Duration::from_secs(60);
+const BOAT_POLL_RETRY: Duration = Duration::from_secs(10);
+/// Costs are looked up this often, and whenever a machine starts or stops.
+const COSTS_EVERY: Duration = Duration::from_secs(300);
+/// Opening the panel looks them up again once older than this.
+const COSTS_FRESH: Duration = Duration::from_secs(30);
 
 /// Why the app cannot run yet, in the order the user has to fix it.
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq)]
@@ -54,12 +61,11 @@ pub enum MachineState {
     Asleep,
     Waking,
     Creating,
-    Error,
     Missing,
     Unknown,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineView {
     pub id: String,
@@ -67,11 +73,15 @@ pub struct MachineView {
     pub size: String,
     pub state: MachineState,
     pub detail: String,
+    /// Why the last wake failed, in plain words, until one succeeds or T3 answers anyway; not while it wakes again.
+    pub wake_error: Option<String>,
     /// Set while `detail` counts down, so the UI can tick it between updates.
     pub countdown: Option<Countdown>,
     pub paired: bool,
-    /// Agents that need a sign-in on this machine (done in T3 Code, per machine).
-    pub signed_out: Vec<String>,
+    /// Its agents whose sign-in is known; one signed out needs it (done in T3 Code, per machine).
+    pub agents: Vec<AgentLogin>,
+    /// Empty while unknown.
+    pub t3_version: String,
     /// Its T3 projects as last seen, and those being added (with their progress).
     pub projects: Vec<crate::machine::projects::MachineProject>,
     /// When a "keep awake" runs out (unix ms); none when off or until stopped.
@@ -79,6 +89,8 @@ pub struct MachineView {
     pub keep_awake_forever: bool,
     /// An agent there waits on the user: a resize waits for the next sleep.
     pub waiting: bool,
+    /// T3 Connect is on: other devices reach it with the user's T3 account.
+    pub connect: bool,
 }
 
 /// `detail` as `template` with `{left}` filled in: the time left until `ends_at` (unix ms).
@@ -87,6 +99,14 @@ pub struct MachineView {
 pub struct Countdown {
     pub template: &'static str,
     pub ends_at: u64,
+}
+
+/// Deadlines under 2 s apart are the same: each status a machine reports puts its own at a
+/// slightly different time.
+impl PartialEq for Countdown {
+    fn eq(&self, other: &Self) -> bool {
+        self.template == other.template && self.ends_at.abs_diff(other.ends_at) < 2000
+    }
 }
 
 impl Countdown {
@@ -113,13 +133,14 @@ pub struct MachineUsage {
     pub awake_secs_today: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Costs {
     pub today: f64,
     pub month: f64,
     pub starts_today: u64,
-    pub starts_limit: u64,
+    /// None: Boat sets no limit.
+    pub starts_limit: Option<u64>,
 }
 
 /// A machine being created: it holds its name and local port until it exists.
@@ -161,6 +182,8 @@ pub struct App {
     machines: RwLock<Vec<Running>>,
     creating: Mutex<Vec<Creating>>,
     starts: Mutex<Starts>,
+    /// When costs were last looked up.
+    costs_at: Mutex<Option<Instant>>,
     /// By sandbox id, gone sandboxes included: `Spend`.
     spend: Mutex<HashMap<String, Spend>>,
     retired_ports: Mutex<Vec<u16>>,
@@ -168,6 +191,8 @@ pub struct App {
     doomed: Mutex<Vec<Doomed>>,
     /// Wakes the reaper for something just given up.
     reaper: Notify,
+    /// Polls Boat now: a machine was added.
+    power_poll: Notify,
 }
 
 impl App {
@@ -198,6 +223,7 @@ impl App {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             saving: Mutex::new(HashSet::new()),
+            costs_stale: Notify::new(),
         });
         let app = Arc::new(Self {
             shared,
@@ -206,21 +232,102 @@ impl App {
             machines: RwLock::new(Vec::new()),
             creating: Mutex::new(Vec::new()),
             starts: Mutex::new(Starts::default()),
+            costs_at: Mutex::new(None),
             spend: Mutex::new(state.spend),
             retired_ports: Mutex::new(state.retired_ports),
             doomed: Mutex::new(doomed),
             reaper: Notify::new(),
+            power_poll: Notify::new(),
         });
         for record in state.machines {
             app.spawn(app.runtime(record));
         }
         tokio::spawn(app.clone().reap());
+        tokio::spawn(app.clone().follow_power());
+        tokio::spawn(app.clone().follow_costs());
         Ok(app)
     }
 
+    /// Follows every machine's power with one `boat list` a poll. One waking or going to sleep
+    /// also asks for itself, more often (`MachineRuntime::run`).
+    async fn follow_power(self: Arc<Self>) {
+        loop {
+            let wait = match self.poll_power().await {
+                Ok(()) => BOAT_POLL,
+                Err(e) => {
+                    tracing::warn!("listing sandboxes: {e:#}");
+                    BOAT_POLL_RETRY
+                }
+            };
+            tokio::select! {
+                _ = self.power_poll.notified() => {}
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+    }
+
+    async fn poll_power(&self) -> Result<()> {
+        // Read before the list: a restore meanwhile moves a machine to a sandbox the list predates.
+        // Missing is final: nothing left to ask about it.
+        let machines: Vec<_> = self
+            .machines()
+            .into_iter()
+            .filter(|m| m.power() != Power::Missing)
+            .map(|m| (m.sandbox_id(), m))
+            .collect();
+        if machines.is_empty() {
+            return Ok(());
+        }
+        let boat = &self.shared.boat;
+        // Complete or cut short alike: a machine it leaves out is asked about on its own, after
+        // every listed one, so a slow answer holds none of them up. Without a list, so is one
+        // never seen yet: it would show Checking until a list works.
+        let listing = boat.list().await;
+        let mut omitted = Vec::new();
+        for (id, m) in machines {
+            match &listing {
+                Ok(listing) => match listing.sandboxes.iter().find(|s| s.id == id) {
+                    Some(sandbox) => {
+                        m.observe(&id, Some(sandbox));
+                    }
+                    None => omitted.push((id, m)),
+                },
+                Err(_) if m.power() == Power::Unknown => omitted.push((id, m)),
+                Err(_) => {}
+            }
+        }
+        for (id, m) in omitted {
+            match boat.find(&id).await {
+                Ok(sandbox) => {
+                    m.observe(&id, sandbox.as_ref());
+                }
+                Err(e) => tracing::warn!("boat info {id}: {e:#}"),
+            }
+        }
+        listing.map(drop)
+    }
+
+    /// Looks costs up on a timer and whenever a machine starts or stops.
+    async fn follow_costs(self: Arc<Self>) {
+        loop {
+            self.refresh_costs().await;
+            tokio::select! {
+                _ = self.shared.costs_stale.notified() => {}
+                _ = tokio::time::sleep(COSTS_EVERY) => {}
+            }
+        }
+    }
+
+    /// Someone looks at the costs: looked up again unless just done.
+    pub fn want_fresh_costs(&self) {
+        if self.costs_at.lock().unwrap().is_none_or(|t| t.elapsed() >= COSTS_FRESH) {
+            self.shared.costs_stale.notify_one();
+        }
+    }
+
     /// Deletes what was given up until Boat confirms each gone: a sandbox left behind bills
-    /// without limit, and Boat can be down for a while. Done only on Boat's own list, never on
-    /// a delete's answer alone.
+    /// without limit, and Boat can be down for a while. Done only on Boat's list or `info`, never
+    /// on a delete's answer alone.
     async fn reap(self: Arc<Self>) {
         let mut reaping: HashMap<String, Reaping> = HashMap::new();
         loop {
@@ -241,7 +348,7 @@ impl App {
         let doomed = self.doomed.lock().unwrap().clone();
         let boat = &self.shared.boat;
         let sandboxes = if doomed.iter().any(|d| d.sandbox.is_some()) {
-            let listed = boat.list().await.map(|l| l.into_iter().map(|s| s.id).collect::<Vec<_>>());
+            let listed = boat.list().await;
             listed.inspect_err(|e| tracing::warn!("listing sandboxes to confirm deletes: {e:#}")).ok()
         } else {
             None
@@ -261,15 +368,25 @@ impl App {
                 if self.shared.saving.lock().unwrap().contains(id) {
                     continue;
                 }
+                // Left out of a list cut short, or with no list, it is gone only if Boat says so
+                // of it.
+                let gone = async {
+                    match &sandboxes {
+                        Some(l) if l.sandboxes.iter().any(|s| s.id == *id) => false,
+                        Some(l) if l.complete => true,
+                        _ => matches!(boat.find(id).await, Ok(None)),
+                    }
+                };
                 let delete = boat.delete(id);
-                if !self.reap_one(reaping, id, sandboxes.as_deref(), "sandbox", "boat delete", delete).await {
+                if !self.reap_one(reaping, id, gone, "sandbox", "boat delete", delete).await {
                     continue;
                 }
                 left.sandbox = None;
             }
             if let Some(name) = &pair.snapshot {
+                let gone = async { snapshots.as_ref().is_some_and(|l| !l.contains(name)) };
                 let delete = boat.delete_snapshot(name);
-                if self.reap_one(reaping, name, snapshots.as_deref(), "saved snapshot", "boat snapshot rm", delete).await {
+                if self.reap_one(reaping, name, gone, "saved snapshot", "boat snapshot rm", delete).await {
                     left.snapshot = None;
                 }
             }
@@ -291,21 +408,21 @@ impl App {
         !self.doomed.lock().unwrap().is_empty()
     }
 
-    /// Deletes `key` unless Boat's `listed` confirms it gone, which counts only after a delete
-    /// ran: a list can leave out one it still bills. With no list (`None`, as when it failed),
-    /// it is deleted again. Tells the user once of one pending past `REAP_WARN`. Returns whether
-    /// it is confirmed gone.
+    /// Deletes `key` unless Boat confirms it `gone`, which counts only after a delete ran: a list
+    /// can leave out one it still bills. Unconfirmed (as when Boat's answer failed), it is
+    /// deleted again. Tells the user once of one pending past `REAP_WARN`. Returns whether it is
+    /// confirmed gone.
     async fn reap_one(
         &self,
         reaping: &mut HashMap<String, Reaping>,
         key: &str,
-        listed: Option<&[String]>,
+        gone: impl Future<Output = bool>,
         what: &str,
         cmd: &str,
         delete: impl Future<Output = Result<()>>,
     ) -> bool {
         let p = reaping.entry(key.to_owned()).or_insert(Reaping { since: Instant::now(), told: false, deleted: false });
-        if p.deleted && listed.is_some_and(|l| !l.iter().any(|k| k == key)) {
+        if p.deleted && gone.await {
             reaping.remove(key);
             return true;
         }
@@ -459,6 +576,7 @@ impl App {
                 tracing::warn!("priming {}: {e:#}", machine.id());
             }
             self.spawn(machine.clone());
+            self.power_poll.notify_one();
             Ok::<_, anyhow::Error>(machine)
         }
         .await;
@@ -475,6 +593,8 @@ impl App {
         };
         self.shared.persist();
         self.shared.changed();
+        // A start counts, whether or not the create got further.
+        self.shared.costs_stale.notify_one();
         if failed {
             self.reaper.notify_one();
         }
@@ -483,7 +603,8 @@ impl App {
         tokio::spawn(async move {
             for id in projects {
                 if let Err(e) = app.add_project(&m, &id).await {
-                    app.shared.notify(format!("A project didn't reach {}", m.record().name), format!("{e:#}"));
+                    tracing::warn!("adding project {id} to {}: {e:#}", m.id());
+                    app.shared.notify(format!("A project didn't reach {}", m.record().name), crate::boat::plain(&e));
                 }
             }
         });
@@ -532,8 +653,7 @@ impl App {
     /// to remove there.
     pub async fn delete_machine(&self, machine: &MachineRuntime, discard: bool) -> Result<()> {
         // Boat can't report a deleted sandbox's usage: the last chance to count its tail.
-        let (day, month) = periods();
-        self.refresh_spend(machine, day, month).await;
+        self.refresh_spend(machine).await;
         if !discard {
             machine.check_idle_before_delete().await?;
         }
@@ -585,13 +705,16 @@ impl App {
                 size: String::new(),
                 state: MachineState::Creating,
                 detail: c.step.clone(),
+                wake_error: None,
                 countdown: None,
                 paired: false,
-                signed_out: Vec::new(),
+                agents: Vec::new(),
+                t3_version: String::new(),
                 projects: Vec::new(),
                 keep_awake_until: None,
                 keep_awake_forever: false,
                 waiting: false,
+                connect: false,
             });
         }
         views
@@ -600,7 +723,7 @@ impl App {
     /// Totals count every sandbox spent on this month, those of deleted machines and those a
     /// restore replaced included.
     pub fn costs(&self) -> Costs {
-        let (day, month) = periods();
+        let (day, month) = periods(chrono::Local::now());
         let starts = self.starts.lock().unwrap().clone();
         let mut costs =
             Costs { starts_today: starts.used_today, starts_limit: starts.limit_today, ..Costs::default() };
@@ -613,7 +736,7 @@ impl App {
     }
 
     fn usage(&self, machine: &MachineRuntime) -> MachineUsage {
-        let (day, month) = periods();
+        let (day, month) = periods(chrono::Local::now());
         let id = machine.id();
         let mut total = MachineUsage::default();
         for spend in self.spend.lock().unwrap().values().filter(|s| s.machine == id) {
@@ -627,36 +750,54 @@ impl App {
 
     /// Looks up the spend of the machine's current sandbox. A failed lookup keeps the last known
     /// figures, never a fake zero.
-    async fn refresh_spend(&self, machine: &MachineRuntime, day: i64, month: i64) {
+    async fn refresh_spend(&self, machine: &MachineRuntime) {
         if machine.power() == Power::Missing {
             return;
         }
         let boat = &self.shared.boat;
         let sandbox = machine.sandbox_id();
+        // Before the lookup: one a stop overtakes must not pass for its final figures. Its
+        // periods from the same instant, or one spanning midnight files under the day before.
+        let now = chrono::Local::now();
+        let at = now.timestamp();
+        let (day, month) = periods(now);
         let Ok((today, this_month)) = tokio::try_join!(boat.usage_since(&sandbox, day), boat.usage_since(&sandbox, month))
         else {
             return;
         };
         let spend = Spend {
             machine: machine.id(),
+            at,
             day,
             today: today.dollars,
             awake_secs_today: today.seconds,
             month: this_month.dollars,
         };
-        self.spend.lock().unwrap().insert(sandbox, spend);
+        // A slower lookup that started earlier must not overwrite a newer one's figures.
+        let mut all = self.spend.lock().unwrap();
+        if all.get(&sandbox).is_none_or(|s| s.at <= at) {
+            all.insert(sandbox, spend);
+        }
     }
 
     pub async fn refresh_costs(&self) {
-        let (day, month) = periods();
         let boat = &self.shared.boat;
         for m in self.machines() {
-            self.refresh_spend(&m, day, month).await;
+            // Stopped since the last lookup: it spent nothing since.
+            let settled = m.power() == Power::Stopped
+                && m.stopped_at().is_some_and(|stop| {
+                    self.spend.lock().unwrap().get(&m.sandbox_id()).is_some_and(|s| s.at > stop.timestamp())
+                });
+            if !settled {
+                self.refresh_spend(&m).await;
+            }
         }
+        let (_, month) = periods(chrono::Local::now());
         self.spend.lock().unwrap().retain(|_, s| s.day >= month);
         if let Ok(starts) = boat.starts().await {
             *self.starts.lock().unwrap() = starts;
         }
+        *self.costs_at.lock().unwrap() = Some(Instant::now());
         self.shared.persist();
         self.shared.changed();
     }
@@ -672,10 +813,9 @@ fn local_time(t: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
-/// Starts of the current local day and month, unix seconds.
-fn periods() -> (i64, i64) {
+/// Starts of `now`'s local day and month, unix seconds.
+fn periods(now: chrono::DateTime<chrono::Local>) -> (i64, i64) {
     use chrono::{Datelike, Local, TimeZone};
-    let now = Local::now();
     let start = |day| {
         Local
             .with_ymd_and_hms(now.year(), now.month(), day, 0, 0, 0)
@@ -705,14 +845,10 @@ pub struct MachineDetails {
     pub cost_today: f64,
     pub cost_month: f64,
     pub awake_secs_today: u64,
-    pub agents: Vec<AgentLogin>,
-    pub t3_version: String,
     pub created_at: i64,
-    /// T3 Connect is on: other devices reach it with the user's T3 account.
-    pub connect: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLogin {
     pub name: String,
@@ -723,24 +859,13 @@ impl App {
     /// Never wakes the machine.
     pub fn details(&self, machine: &str) -> Result<MachineDetails> {
         let machine = self.machine(machine)?;
-        let id = machine.id();
-        let record = machine.record();
         let usage = self.usage(&machine);
-        let agents = machine.cache.lock().unwrap().agents();
         Ok(MachineDetails {
-            id,
+            id: machine.id(),
             cost_today: usage.today,
             cost_month: usage.month,
             awake_secs_today: usage.awake_secs_today,
-            // Only agents whose status is known, so this agrees with `signed_out` in the list.
-            agents: agents
-                .into_iter()
-                .filter(|(_, status)| matches!(status.as_str(), "authenticated" | "unauthenticated"))
-                .map(|(name, status)| AgentLogin { name, signed_in: status == "authenticated" })
-                .collect(),
-            t3_version: record.t3_version,
-            created_at: record.created_at,
-            connect: record.connect,
+            created_at: machine.record().created_at,
         })
     }
 
@@ -771,7 +896,6 @@ fn view(m: &MachineRuntime) -> MachineView {
     use MachineState::*;
     let (state, detail) = match (m.power(), &watchdog) {
         (Power::Missing, _) => (Missing, "Deleted on Boat".to_owned()),
-        (_, _) if m.last_error().is_some() => (Error, m.last_error().unwrap_or_default()),
         (Power::Running, Some(w)) if w.agents_unknown => (Working, "T3 not answering · stays up 30m max".to_owned()),
         (Power::Running, Some(w)) if w.cpu_busy => (Working, "Working · busy CPU".to_owned()),
         (Power::Running, Some(w)) if w.busy => (Working, working_line(w.working_threads, w.working_subagents)),
@@ -806,15 +930,19 @@ fn view(m: &MachineRuntime) -> MachineView {
         size: r.size.clone(),
         state,
         detail,
+        // Waking again, the last failure is no news; gone, it is beside the point.
+        wake_error: m.wake_error().filter(|_| !m.is_waking() && m.power() != Power::Missing),
         countdown,
         paired: !r.client_tokens.is_empty(),
-        signed_out: m.cache.lock().unwrap().signed_out_providers(),
+        agents: m.cache.lock().unwrap().agents().into_iter().map(|(name, signed_in)| AgentLogin { name, signed_in }).collect(),
+        t3_version: r.t3_version.clone(),
         projects: m.projects(),
         keep_awake_until: running_watchdog
             .filter(|w| w.keep_awake_secs > 0)
             .map(|w| unix_ms_after(w.received, w.keep_awake_secs)),
         keep_awake_forever: running_watchdog.is_some_and(|w| w.keep_awake_forever),
         waiting: running_watchdog.is_some_and(|w| w.waiting_threads > 0),
+        connect: r.connect,
     }
 }
 
@@ -886,7 +1014,7 @@ mod tests {
     #[test]
     fn spend_counts_only_in_its_periods() {
         let spend =
-            crate::store::Spend { machine: "m".into(), day: 100, today: 1.0, awake_secs_today: 60, month: 5.0 };
+            crate::store::Spend { machine: "m".into(), at: 100, day: 100, today: 1.0, awake_secs_today: 60, month: 5.0 };
         let same_day = super::usage(&spend, 100, 0);
         assert_eq!((same_day.today, same_day.awake_secs_today, same_day.month), (1.0, 60, 5.0));
         let later_day = super::usage(&spend, 200, 0);
@@ -904,7 +1032,7 @@ echo "$*" >> "$d/log"
 case "$1" in
   list) [ -f "$d/list-down" ] && exit 1
     a='{"id":"bx_a","state":"running"},'; [ -f "$d/bx_a-gone" ] && a=
-    echo "{\"sandboxes\":[$a{\"id\":\"bx_stuck\",\"state\":\"error\"}]}" ;;
+    echo "{\"pageInfo\":{\"hasMore\":false},\"sandboxes\":[$a{\"id\":\"bx_stuck\",\"state\":\"error\"}]}" ;;
   delete) case "$2" in
     bx_a) [ -f "$d/up" ] || { echo 'Boat is down' >&2; exit 1; }; touch "$d/bx_a-gone" ;;
     bx_ghost|bx_new) ;;

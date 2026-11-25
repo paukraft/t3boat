@@ -107,7 +107,6 @@
 .state-working .row-detail {
   color: var(--accent-text);
 }
-.state-error .row-detail,
 .state-missing .row-detail {
   color: var(--danger);
 }

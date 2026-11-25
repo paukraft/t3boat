@@ -136,7 +136,6 @@ button.row-name {
 .state-working .glance-detail {
   color: var(--accent-text);
 }
-.state-error .glance-state,
 .state-missing .glance-state {
   color: var(--danger);
 }
@@ -163,7 +162,6 @@ button.row-name {
   background: none;
   box-shadow: inset 0 0 0 1px var(--muted);
 }
-.state-error .glance .state-dot,
 .state-missing .glance .state-dot {
   background: var(--danger);
 }

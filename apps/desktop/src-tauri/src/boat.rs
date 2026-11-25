@@ -34,6 +34,13 @@ impl Sandbox {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Listing {
+    pub sandboxes: Vec<Sandbox>,
+    /// Every sandbox is in it, so one left out is gone. Boat cuts a long list short.
+    pub complete: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
@@ -76,7 +83,8 @@ pub enum Resume {
 #[derive(Clone, Debug, Default)]
 pub struct Starts {
     pub used_today: u64,
-    pub limit_today: u64,
+    /// None: Boat sets no limit.
+    pub limit_today: Option<u64>,
 }
 
 impl Boat {
@@ -117,23 +125,24 @@ impl Boat {
         ))
     }
 
-    /// Free-trial accounts refuse `--no-auto-stop`; they get Boat's longest trial lifetime instead.
-    async fn output_without_auto_stop(&self, args: &[&str], timeout: Duration) -> Result<(bool, String, String)> {
-        let (ok, stdout, stderr) = self.output(&[args, &["--no-auto-stop"]].concat(), timeout).await?;
-        if ok || !said(&stdout, &stderr).contains("trial_auto_stop_required") {
-            return Ok((ok, stdout, stderr));
-        }
-        let ttl = TRIAL_TTL_SECS.to_string();
-        self.output(&[args, &["--ttl", &ttl]].concat(), timeout).await
-    }
-
+    /// Fails with Boat's `Refusal` when the command does.
     async fn run(&self, args: &[&str], timeout: Duration) -> Result<String> {
         let (ok, stdout, stderr) = self.output(args, timeout).await?;
         if !ok {
-            let sub = args.first().copied().unwrap_or_default();
-            bail!("boat {sub} failed: {}", said(&stdout, &stderr));
+            return Err(Refusal::new(args.first().copied().unwrap_or_default(), &stdout, &stderr).into());
         }
         Ok(stdout)
+    }
+
+    /// Free-trial accounts refuse `--no-auto-stop`; they get Boat's longest trial lifetime instead.
+    async fn run_without_auto_stop(&self, args: &[&str], timeout: Duration) -> Result<String> {
+        match self.run(&[args, &["--no-auto-stop"]].concat(), timeout).await {
+            Err(e) if refused(&e, "trial_auto_stop_required") => {
+                let ttl = TRIAL_TTL_SECS.to_string();
+                self.run(&[args, &["--ttl", &ttl]].concat(), timeout).await
+            }
+            result => result,
+        }
     }
 
     /// The CLI prints JSON lines for long operations; the last line is the result.
@@ -155,11 +164,7 @@ impl Boat {
     pub async fn create(&self, name: &str, size: &str, snapshot: Option<&str>) -> Result<String> {
         let mut args = vec!["new", "--name", name, "--type", size];
         args.extend(snapshot.into_iter().flat_map(|s| ["--from", s]));
-        let (ok, stdout, stderr) = self.output_without_auto_stop(&args, Duration::from_secs(300)).await?;
-        if !ok {
-            bail!("boat new failed: {}", said(&stdout, &stderr));
-        }
-        let v = Self::last_json(&stdout)?;
+        let v = Self::last_json(&self.run_without_auto_stop(&args, Duration::from_secs(300)).await?)?;
         let id = v["id"].as_str().ok_or_else(|| anyhow!("boat new returned no id"))?;
         Ok(id.to_owned())
     }
@@ -169,25 +174,31 @@ impl Boat {
         Ok(serde_json::from_value(v["sandbox"].clone())?)
     }
 
-    pub async fn list(&self) -> Result<Vec<Sandbox>> {
-        let v = Self::last_json(&self.run(&["list", "--all"], Duration::from_secs(20)).await?)?;
-        Ok(serde_json::from_value(v["sandboxes"].clone())?)
+    /// `info`, `None` when Boat says it has no such sandbox: one bad answer must not pass for gone.
+    pub async fn find(&self, id: &str) -> Result<Option<Sandbox>> {
+        match self.info(id).await {
+            Ok(sandbox) => Ok(Some(sandbox)),
+            Err(e) if refused(&e, "not_found") => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
-    /// Gone only when Boat's own list confirms it: one bad answer must not retire a machine.
-    pub async fn confirmed_gone(&self, id: &str) -> bool {
-        matches!(self.list().await, Ok(l) if l.iter().all(|s| s.id != id))
+    /// Boat's sandboxes, as many as it lists at once.
+    pub async fn list(&self) -> Result<Listing> {
+        let v = Self::last_json(&self.run(&["list", "--all"], Duration::from_secs(20)).await?)?;
+        Ok(Listing {
+            sandboxes: serde_json::from_value(v["sandboxes"].clone())?,
+            // Only Boat saying so: a list it may have cut short never counts a sandbox gone.
+            complete: v["pageInfo"]["hasMore"] == false,
+        })
     }
 
     /// Resumes onto `size`, which is how a machine changes size.
     pub async fn resume(&self, id: &str, size: &str) -> Result<Resume> {
-        let (ok, stdout, stderr) =
-            self.output_without_auto_stop(&["resume", id, "--type", size], Duration::from_secs(300)).await?;
-        let said = said(&stdout, &stderr);
-        match ok {
-            true => Ok(Resume::Resumed),
-            false if said.contains("snapshot_data_expired") => Ok(Resume::DataExpired),
-            false => bail!("boat resume failed: {said}"),
+        match self.run_without_auto_stop(&["resume", id, "--type", size], Duration::from_secs(300)).await {
+            Ok(_) => Ok(Resume::Resumed),
+            Err(e) if refused(&e, "snapshot_data_expired") => Ok(Resume::DataExpired),
+            Err(e) => Err(e),
         }
     }
 
@@ -279,10 +290,10 @@ impl Boat {
 
     pub async fn starts(&self) -> Result<Starts> {
         let v = Self::last_json(&self.run(&["limits", "--all"], Duration::from_secs(20)).await?)?;
-        let day = &v["starts"]["day"];
+        let starts = &v["starts"];
         Ok(Starts {
-            used_today: day["used"].as_u64().unwrap_or(0),
-            limit_today: day["limit"].as_u64().unwrap_or(0),
+            used_today: starts["day"]["used"].as_u64().unwrap_or(0),
+            limit_today: starts["day"]["limit"].as_u64().filter(|_| starts["unlimited"] != true),
         })
     }
 
@@ -339,6 +350,66 @@ fn said<'a>(stdout: &'a str, stderr: &'a str) -> &'a str {
     if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() }
 }
 
+/// Boat refused a command. Its own words, for the logs, are what it displays; the user reads
+/// `plain`.
+#[derive(Debug)]
+pub struct Refusal {
+    sub: String,
+    /// From the error line `--json` prints: `{"code":…,"error":…,"status":…}`.
+    code: Option<String>,
+    said: String,
+}
+
+impl Refusal {
+    fn new(sub: &str, stdout: &str, stderr: &str) -> Self {
+        let said = said(stdout, stderr).to_owned();
+        let code = Boat::last_json(&said).ok().and_then(|v| v["code"].as_str().map(str::to_owned));
+        Self { sub: sub.to_owned(), code, said }
+    }
+
+    /// What it means for the user. Codes from docs.boat.dev (API errors, free trial, troubleshooting).
+    fn plain(&self) -> &'static str {
+        match self.code.as_deref() {
+            Some("rate_limited") => "Boat's limit on machine starts is reached for now. Try again later.",
+            Some("limit_reached") => "Your Boat plan has as many machines awake as it allows. Put one to sleep first.",
+            Some("member_limit_reached") => {
+                "Your Boat organization caps how many machines you have awake. Put one to sleep, or ask the owner to raise your cap."
+            }
+            Some("trial_compute_limit_reached") => "Your Boat free trial's hours are used up. Start a plan on Boat to go on.",
+            Some("trial_machine_class_not_allowed") => "This size needs a paid Boat plan.",
+            Some("trial_saved_snapshots_not_allowed") => "Saving a backup needs a paid Boat plan.",
+            Some("billing_required") => "Boat needs a payment first. Check billing on boat.dev.",
+            Some("credit_required") => "Your Boat wallet is empty. Add money on boat.dev.",
+            Some("team_member_cap_reached") => "You reached the spending cap your Boat organization set. An owner can raise it.",
+            Some("org_suspended") => "Your Boat organization's wallet is suspended.",
+            Some("unauthorized") => "You're signed out of Boat.",
+            Some("not_found") => "Boat no longer has this machine.",
+            Some("snapshot_not_found") => "Boat has no saved backup of this machine.",
+            Some("no_ready_machine" | "service_unavailable") => "Boat has no machine free right now. Try again in a moment.",
+            _ => "Boat couldn't do that just now. Try again in a moment.",
+        }
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "boat {} failed: {}", self.sub, self.said)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// Boat refused with this code.
+fn refused(e: &anyhow::Error, code: &str) -> bool {
+    e.downcast_ref::<Refusal>().is_some_and(|r| r.code.as_deref() == Some(code))
+}
+
+/// An error as the user reads it: Boat's refusals in plain words, the rest as is.
+pub fn plain(e: &anyhow::Error) -> String {
+    let part = |c: &(dyn std::error::Error + 'static)| c.downcast_ref::<Refusal>().map_or_else(|| c.to_string(), |r| r.plain().into());
+    e.chain().map(part).collect::<Vec<_>>().join(": ")
+}
+
 /// Command-line form of a path; the Boat CLI and git only take UTF-8 here.
 pub(crate) fn path_str(path: &Path) -> Result<&str> {
     path.to_str().ok_or_else(|| anyhow!("path is not UTF-8: {}", path.display()))
@@ -346,7 +417,7 @@ pub(crate) fn path_str(path: &Path) -> Result<&str> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{Boat, Resume, Sandbox};
+    use super::{plain, Boat, Refusal, Resume, Sandbox};
     use std::os::unix::fs::PermissionsExt;
 
     const TRIAL_BOAT: &str = r#"#!/bin/sh
@@ -407,6 +478,20 @@ esac
         assert!(err.contains("Boat is down"), "{err}");
         assert_eq!(calls(&dir), ["new --name m --type default --no-auto-stop"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refusals_read_plainly() {
+        let refusal = |said: &str| anyhow::Error::from(Refusal::new("resume", said, said));
+        let limit = refusal(
+            r#"{"code":"rate_limited","error":"You used all 200 sandbox starts included in the last 24 hours.","event":"error","status":429}"#,
+        );
+        assert_eq!(plain(&limit), "Boat's limit on machine starts is reached for now. Try again later.");
+        assert!(format!("{limit:#}").contains("You used all 200"), "Boat's own words stay in the logs");
+        assert_eq!(plain(&refusal("Boat is down")), "Boat couldn't do that just now. Try again in a moment.");
+        let restore = refusal(r#"{"code":"snapshot_not_found","error":"not found","status":404}"#).context("restoring failed");
+        assert_eq!(plain(&restore), "restoring failed: Boat has no saved backup of this machine.");
+        assert_eq!(plain(&anyhow::anyhow!("T3 did not answer")), "T3 did not answer");
     }
 
     #[test]

@@ -74,8 +74,8 @@ export function MachineDetails({
       <div className="view-body details-body">
         <Glance m={m} size={sizeOf(sizes, m.size)} d={d} />
         {gone ? null : <Power m={m} busy={busy} onAction={onAction} />}
-        <Agents m={m} d={d} pending={pending} onAction={onAction} />
-        <Connect m={m} d={d} pending={pending} onAction={onAction} />
+        {m.agents.length > 0 && <Agents m={m} pending={pending} onAction={onAction} />}
+        <Connect m={m} pending={pending} onAction={onAction} />
         <Projects m={m} pickProject={pickProject} onAddProject={onAddProject} />
         <MachineMore
           m={m}
@@ -88,8 +88,12 @@ export function MachineDetails({
         <p className="details-meta">
           {d ? (
             <>
-              <span>T3 {d.t3Version}</span>
-              <span className="sep">·</span>
+              {m.t3Version && (
+                <>
+                  <span>T3 {m.t3Version}</span>
+                  <span className="sep">·</span>
+                </>
+              )}
               <span>created {shortDate(d.createdAt)}</span>
               <span className="sep">·</span>
               <span className="selectable details-id">{m.id}</span>
@@ -217,11 +221,22 @@ function Power({ m, busy, onAction }: { m: MachineView; busy: boolean; onAction:
         />
       </label>
       <div className="power-row">
-        <button className="btn btn-sm btn-quiet" disabled={busy || !power} onClick={() => power && onAction(power)}>
-          {(power ?? ACTIONS.sleep).label}
-        </button>
+        {/* the wake-failure note below has the same action as "Try again" */}
+        {m.wakeError && power === ACTIONS.wake ? null : (
+          <button className="btn btn-sm btn-quiet" disabled={busy || !power} onClick={() => power && onAction(power)}>
+            {(power ?? ACTIONS.sleep).label}
+          </button>
+        )}
         {on ? <StayAwake m={m} busy={busy} onAction={onAction} /> : null}
       </div>
+      {m.wakeError ? (
+        <div className="row-note is-danger" role="alert">
+          <span className="row-note-text">Couldn't wake: {m.wakeError}</span>
+          <button className="btn btn-link" disabled={busy} onClick={() => onAction(ACTIONS.retry)}>
+            {ACTIONS.retry.label}
+          </button>
+        </div>
+      ) : null}
     </Section>
   );
 }
@@ -275,114 +290,82 @@ function StayAwake({ m, busy, onAction }: { m: MachineView; busy: boolean; onAct
   );
 }
 
-function Agents({
-  m,
-  d,
-  pending,
-  onAction,
-}: {
-  m: MachineView;
-  d: Details | null;
-  pending: string | null;
-  onAction: (a: Action) => void;
-}) {
+function Agents({ m, pending, onAction }: { m: MachineView; pending: string | null; onAction: (a: Action) => void }) {
   const [signingIn, setSigningIn] = useState<string | null>(null);
   return (
     <Section title="agents">
       <ul className="lines">
-        {d ? (
-          d.agents.map((a) => {
-            const running = signingIn === a.name && pending === signInTo(a.name).busy;
-            return (
-              <li key={a.name} className="line">
-                <span className="line-main">
-                  <AgentName name={a.name} />
-                </span>
-                {a.signedIn ? (
-                  <span className="line-ok">
-                    <Icon name="check" size={10} /> signed in
-                  </span>
-                ) : m.signedOut.includes(a.name) ? (
-                  <button
-                    className="btn btn-sm btn-outline"
-                    disabled={!!pending || m.state === "missing"}
-                    aria-busy={running}
-                    onClick={() => {
-                      setSigningIn(a.name);
-                      onAction(signInTo(a.name));
-                    }}
-                  >
-                    {running ? (
-                      <>
-                        <Dots /> Signing in…
-                      </>
-                    ) : (
-                      "Sign in"
-                    )}
-                  </button>
-                ) : (
-                  <span className="caption">signed out</span>
-                )}
-              </li>
-            );
-          })
-        ) : (
-          <Skeleton rows={2} />
-        )}
-      </ul>
-    </Section>
-  );
-}
-
-/** T3 Connect: the user's phone or a browser reach the machine with their T3 account. */
-function Connect({
-  m,
-  d,
-  pending,
-  onAction,
-}: {
-  m: MachineView;
-  d: Details | null;
-  pending: string | null;
-  onAction: (a: Action) => void;
-}) {
-  const running = pending === ACTIONS.connect.busy;
-  return (
-    <Section title="other devices">
-      <ul className="lines">
-        {d ? (
-          <>
-            <li className="line">
-              <span className="line-main">T3 Connect</span>
-              {d.connect ? (
+        {m.agents.map((a) => {
+          const running = signingIn === a.name && pending === signInTo(a.name).busy;
+          return (
+            <li key={a.name} className="line">
+              <span className="line-main">
+                <AgentName name={a.name} />
+              </span>
+              {a.signedIn ? (
                 <span className="line-ok">
-                  <Icon name="check" size={10} /> on
+                  <Icon name="check" size={10} /> signed in
                 </span>
               ) : (
                 <button
                   className="btn btn-sm btn-outline"
                   disabled={!!pending || m.state === "missing"}
                   aria-busy={running}
-                  onClick={() => onAction(ACTIONS.connect)}
+                  onClick={() => {
+                    setSigningIn(a.name);
+                    onAction(signInTo(a.name));
+                  }}
                 >
                   {running ? (
                     <>
-                      <Dots /> {ACTIONS.connect.busy}
+                      <Dots /> Signing in…
                     </>
                   ) : (
-                    ACTIONS.connect.label
+                    "Sign in"
                   )}
                 </button>
               )}
             </li>
-            {d.connect ? null : (
-              <li className="line">
-                <span className="line-main line-dim">T3 Code on your phone or in a browser, with your T3 account</span>
-              </li>
-            )}
-          </>
-        ) : (
-          <Skeleton rows={1} />
+          );
+        })}
+      </ul>
+    </Section>
+  );
+}
+
+/** T3 Connect: the user's phone or a browser reach the machine with their T3 account. */
+function Connect({ m, pending, onAction }: { m: MachineView; pending: string | null; onAction: (a: Action) => void }) {
+  const running = pending === ACTIONS.connect.busy;
+  return (
+    <Section title="other devices">
+      <ul className="lines">
+        <li className="line">
+          <span className="line-main">T3 Connect</span>
+          {m.connect ? (
+            <span className="line-ok">
+              <Icon name="check" size={10} /> on
+            </span>
+          ) : (
+            <button
+              className="btn btn-sm btn-outline"
+              disabled={!!pending || m.state === "missing"}
+              aria-busy={running}
+              onClick={() => onAction(ACTIONS.connect)}
+            >
+              {running ? (
+                <>
+                  <Dots /> {ACTIONS.connect.busy}
+                </>
+              ) : (
+                ACTIONS.connect.label
+              )}
+            </button>
+          )}
+        </li>
+        {m.connect ? null : (
+          <li className="line">
+            <span className="line-main line-dim">T3 Code on your phone or in a browser, with your T3 account</span>
+          </li>
         )}
       </ul>
     </Section>
@@ -510,17 +493,5 @@ function MachineMore({
         </div>
       </div>
     </details>
-  );
-}
-
-function Skeleton({ rows }: { rows: number }) {
-  return (
-    <>
-      {Array.from({ length: rows }, (_, i) => (
-        <li key={i} className="line" aria-hidden>
-          <span className="skel" style={{ width: `${40 - i * 10}%` }} />
-        </li>
-      ))}
-    </>
   );
 }

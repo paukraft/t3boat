@@ -179,9 +179,10 @@ fn tool_list() -> Value {
         tool(
             "list_machines",
             "Lists the user's t3boat machines with id, size, state (working | idle | asleep | waking | \
-             sleeping | creating | error | missing | unknown (still checking)) and a detail line, agents that still need a sign-in \
-             there (signedOut), its T3 projects (with progress while one is being added), plus Boat \
-             costs today and this month and machine starts used today against the daily limit.",
+             sleeping | creating | missing | unknown (still checking)) and a detail line, why its last wake failed (wakeError), its agents and whether each is signed \
+             in there (agents), its T3 version (t3Version), its T3 projects (with progress while one is being added), whether T3 \
+             Connect is on (connect), plus Boat costs today and this month and machine starts used \
+             today against the daily limit.",
             json!({}),
             &[],
         ),
@@ -272,8 +273,7 @@ fn tool_list() -> Value {
         ),
         tool(
             "machine_details",
-            "One machine's cost today and this month, time awake today, which agents are signed in \
-             there, its T3 version and creation time, and whether T3 Connect is on. Never wakes it.",
+            "One machine's cost today and this month, time awake today and creation time. Never wakes it.",
             json!({ "machine": machine }),
             &["machine"],
         ),
@@ -319,14 +319,14 @@ impl Call {
             ),
             Self::SignInAgent { machine, agent } => format!(
                 "The {agent} sign-in for {machine} is open in the browser; the user must click Authorize. \
-                 list_machines stops listing {agent} under signedOut once done."
+                 list_machines shows {agent} signed in under agents once done."
             ),
             Self::AddProject { machine, project } => format!(
                 "Still cloning {project} onto {machine}; list_machines shows its progress under the machine's projects."
             ),
             Self::TurnOnConnect { machine } => format!(
                 "T3's sign-in page for {machine} is open in the browser; the user must approve it. \
-                 machine_details shows connect: true once other devices can reach it."
+                 list_machines shows connect: true once other devices can reach it."
             ),
             _ => "Still running in the background; list_machines shows the machine's state.".into(),
         }
@@ -340,7 +340,8 @@ impl Tools for App {
         // Detached, so a client that gives up does not cancel the work halfway.
         tokio::spawn(async move {
             if let Err(Err(e)) = tx.send(run(&self, call).await) {
-                self.shared.notify(NAME, format!("{e:#}"));
+                tracing::warn!("tool call the client stopped waiting for: {e:#}");
+                self.shared.notify(NAME, crate::boat::plain(&e));
             }
         });
         match tokio::time::timeout(WAIT, rx).await {

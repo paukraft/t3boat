@@ -138,7 +138,7 @@ fn handshake(m: &Arc<MachineRuntime>, body: &[u8]) -> Option<Response> {
         "initialize" => {
             let m = m.clone();
             tokio::spawn(async move {
-                let _ = m.ensure_awake("a linked T3 server").await;
+                let _ = m.wake_for_request("a linked T3 server").await;
             });
             let session = [(HeaderName::from_static("mcp-session-id"), auth::random_token())];
             let result = json!({

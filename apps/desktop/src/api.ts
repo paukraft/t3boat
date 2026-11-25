@@ -3,8 +3,8 @@ import type { CommandArgs, CommandName, CommandResult, MachineDetails, UiState }
 
 export interface Backend {
   call<C extends CommandName>(cmd: C, args: CommandArgs<C>): Promise<CommandResult<C>>;
-  /** Calls `cb` on every "state" event. Returns an unsubscribe function. */
-  subscribe(cb: (s: UiState) => void): () => void;
+  /** Calls `cb` on every "state" event. Resolves to an unsubscribe function once listening. */
+  subscribe(cb: (s: UiState) => void): Promise<() => void>;
 }
 
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -16,10 +16,7 @@ async function tauriBackend(): Promise<Backend> {
   ]);
   return {
     call: (cmd, args) => invoke(cmd, args ?? undefined),
-    subscribe(cb) {
-      const unlisten = listen<UiState>("state", (e) => cb(e.payload));
-      return () => void unlisten.then((f) => f());
-    },
+    subscribe: (cb) => listen<UiState>("state", (e) => cb(e.payload)),
   };
 }
 
@@ -48,14 +45,22 @@ export function useUiState(): { state: UiState | null; loadError: string | null;
   useEffect(() => {
     let alive = true;
     let unsubscribe: (() => void) | undefined;
-    backend().then((b) => {
-      if (!alive) return;
-      unsubscribe = b.subscribe((s) => alive && setState(s));
+    (async () => {
+      const b = await backend();
+      // Listening before the snapshot: an event sent meanwhile is never sent again.
+      let pushed = false;
+      const stop = await b.subscribe((s) => {
+        pushed = true;
+        if (alive) setState(s);
+      });
+      if (!alive) return stop();
+      unsubscribe = stop;
       b.call("get_state", undefined).then(
-        (s) => alive && setState(s),
+        // an event during the fetch is newer than the snapshot
+        (s) => alive && !pushed && setState(s),
         (e) => alive && setLoadError(errorText(e)),
       );
-    });
+    })();
     return () => {
       alive = false;
       unsubscribe?.();

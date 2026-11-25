@@ -5,19 +5,24 @@
 // ?ready=1 (a new machine comes up in T3 Code with its agents signed in and acme on it, as the website shows it)
 import type { Backend } from "./api";
 import { timeLapse } from "./pixel/clock";
-import type { CommandArgs, CommandName, LocalProject, MachineDetails, MachineProject, MachineView, Setup, UiState } from "./types";
+import type { AgentLogin, CommandArgs, CommandName, LocalProject, MachineDetails, MachineProject, MachineView, Setup, UiState } from "./types";
 
 const params = new URLSearchParams(location.search);
 
-type Seed = Omit<MachineView, "countdown" | "signedOut" | "projects" | "keepAwakeUntil" | "keepAwakeForever" | "waiting"> &
-  Partial<Pick<MachineView, "countdown" | "signedOut" | "projects">>;
+type Seed = Omit<MachineView, "wakeError" | "countdown" | "agents" | "t3Version" | "projects" | "keepAwakeUntil" | "keepAwakeForever" | "waiting" | "connect"> &
+  Partial<Pick<MachineView, "wakeError" | "countdown" | "agents" | "projects" | "connect">>;
+/** Claude and Codex, signed in or not. */
+const agents = (signedIn: boolean): AgentLogin[] => ["Claude", "Codex"].map((name) => ({ name, signedIn }));
 const machine = (m: Seed): MachineView => ({
+  wakeError: null,
   countdown: null,
-  signedOut: [],
+  agents: agents(true),
+  t3Version: "0.0.21",
   projects: [],
   keepAwakeUntil: null,
   keepAwakeForever: false,
   waiting: false,
+  connect: false,
   ...m,
 });
 
@@ -34,7 +39,7 @@ const LOCAL_PROJECTS: LocalProject[] = [
 /** An idle machine's detail: sleeps 3 minutes from now. */
 const idle = () => ({ detail: "Idle · sleeps in 3m", countdown: { template: "Idle · sleeps in {left}", endsAt: Date.now() + 3 * 60_000 } });
 
-const WAKING = { state: "waking", detail: "Waking up…", countdown: null } as const;
+const WAKING = { state: "waking", detail: "Waking up…", wakeError: null, countdown: null } as const;
 
 /** Kept awake until `endsAt` (unix ms). */
 const keptAwake = (endsAt: number) => ({
@@ -56,6 +61,7 @@ const seedMachines: MachineView[] = [
     detail: "Working · 2 threads · 3 subagents",
     paired: true,
     projects: [onMachine("t3code", "github.com/pingdotgg/t3code"), onMachine("website", "github.com/you/website")],
+    connect: true,
   }),
   machine({
     id: "sb_19c0",
@@ -64,20 +70,25 @@ const seedMachines: MachineView[] = [
     state: "idle",
     ...idle(),
     paired: true,
-    signedOut: ["Claude", "Codex"],
+    agents: agents(false),
   }),
   machine({ id: "sb_02bb", name: "scratch", size: "small", state: "idle", detail: "Idle · not in T3 Code yet", paired: false }),
 ];
 
 const manyExtra: MachineView[] = [
   machine({ id: "sb_aa01", name: "docs-site", size: "small", state: "waking", detail: "Waking up…", paired: true }),
-  machine({ id: "sb_aa02", name: "infra", size: "default", state: "error", detail: "Couldn't reach machine", paired: true }),
+  machine({
+    id: "sb_aa02",
+    name: "infra",
+    size: "default",
+    state: "asleep",
+    detail: "Asleep",
+    wakeError: "Boat's limit on machine starts is reached for now. Try again later.",
+    paired: true,
+  }),
   machine({ id: "sb_aa03", name: "old-spike", size: "small", state: "missing", detail: "Deleted on Boat", paired: true }),
   machine({ id: "", name: "new-api", size: "default", state: "creating", detail: "Installing T3 server…", paired: false }),
 ];
-
-/** Machines with T3 Connect on. */
-const connectOn = new Set(["sb_7f2a"]);
 
 /** Per-machine extras get_machine_details adds on top of MachineView. */
 const seedDetails: Record<string, { awake: number; month: number; days: number }> = {
@@ -181,7 +192,7 @@ function create(): MockBackend {
               ...idle(),
               ...(params.get("ready") === "1"
                 ? { paired: true, projects: projects?.length ? [] : [onMachine("acme", "github.com/you/acme")] }
-                : { signedOut: ["Claude", "Codex"] }),
+                : { agents: agents(false) }),
             }
           : m,
       );
@@ -256,14 +267,12 @@ function create(): MockBackend {
 
     async turn_on_connect({ id }) {
       await wait(4000);
-      find(id);
-      connectOn.add(id);
-      emit(); // the details view refetches on every state event
+      patch(id, { connect: true });
     },
 
     async sign_in_agent({ id, agent }) {
       await wait(3000);
-      patch(id, { signedOut: find(id).signedOut.filter((a) => a !== agent) });
+      patch(id, { agents: find(id).agents.map((a) => (a.name === agent ? { ...a, signedIn: true } : a)) });
     },
 
     async open_machine({ id }) {
@@ -273,7 +282,7 @@ function create(): MockBackend {
         patch(id, { paired: true, ...idle() });
       }
       // pretend the user finishes the agent sign-ins in T3 Code
-      if (m.signedOut.length) setTimeout(() => patch(id, { signedOut: [] }), 4000);
+      if (m.agents.some((a) => !a.signedIn)) setTimeout(() => patch(id, { agents: agents(true) }), 4000);
     },
 
     async pair_machine({ id }) {
@@ -309,10 +318,7 @@ function create(): MockBackend {
         costToday,
         costMonth: extra.month + costToday,
         awakeSecsToday: awake,
-        agents: ["Claude", "Codex"].map((name) => ({ name, signedIn: !m.signedOut.includes(name) })),
-        t3Version: "0.0.21",
         createdAt: Math.floor(Date.now() / 1000) - extra.days * 86400,
-        connect: connectOn.has(id),
       };
     },
 
@@ -368,7 +374,7 @@ function create(): MockBackend {
       await wait(120);
       return (handlers[cmd] as (a: typeof args) => Promise<never>)(args);
     },
-    subscribe(cb) {
+    async subscribe(cb) {
       listeners.add(cb);
       return () => listeners.delete(cb);
     },

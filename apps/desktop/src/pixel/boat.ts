@@ -7,8 +7,6 @@ import { hash, Px, type Color } from "./px";
 export interface Pose {
   sail: number; // 0 lowered … 1 fully up
   build: number; // 0 nothing … 1 finished hull + mast + sails
-  tilt: number; // listing (radians-ish)
-  flag: boolean;
   dim: boolean;
   ghost: boolean;
   wake: boolean;
@@ -21,8 +19,6 @@ export interface Pose {
 const BASE: Pose = {
   sail: 1,
   build: 1,
-  tilt: 0,
-  flag: false,
   dim: false,
   ghost: false,
   wake: false,
@@ -72,8 +68,6 @@ export function poseFor(state: MachineState, t: number | null, seed: number, roo
       return { ...BASE, sail: still ? 0.6 : loop(time, 1.6, 2.4) };
     case "creating":
       return { ...BASE, build: still ? 0.55 : clamp01((time % 4.2) / 3.4) };
-    case "error":
-      return { ...BASE, tilt: 0.17, flag: true, sail: 0.75 };
     case "missing":
       return { ...BASE, ghost: true, dim: true };
     case "unknown":
@@ -97,15 +91,11 @@ export function drawBoat(px: Px, cx: number, wy: number, pal: Palette, pose: Pos
   const c = pose.dim ? pal.boatAsleep : pal.boat;
   const ox = cx - 8 + pose.dx;
   const oy = wy + pose.dy;
-  const lean = pose.tilt;
 
   const put = (lx: number, ly: number, col: Color) => {
     if (pose.flip) lx = 15 - lx;
-    // two per-row / per-column shears: hole-free fake rotation
-    const sx = lx + Math.round(-(ly + 2) * lean * 0.6);
-    const sy = ly + Math.round((sx - 8) * lean);
-    const X = ox + sx;
-    const Y = oy + sy;
+    const X = ox + lx;
+    const Y = oy + ly;
     if (pose.ghost && (X + Y) & 1) return;
     px.set(X, Y, col);
   };
@@ -165,15 +155,6 @@ export function drawBoat(px: Px, cx: number, wy: number, pal: Palette, pose: Pos
     const w = 1 + Math.floor((src * 5) / 9);
     const ly = -4 - (jibH - 1) + r;
     for (let k = 0; k < w; k++) put(9 + k, ly, c.sailShade);
-  }
-
-  if (pose.flag && mastLen === 14) {
-    put(9, MAST_TOP, pal.flag);
-    put(10, MAST_TOP, pal.flag);
-    put(11, MAST_TOP, pal.flag);
-    put(9, MAST_TOP + 1, pal.flag);
-    put(10, MAST_TOP + 1, pal.flag);
-    put(8, MAST_TOP, c.mast);
   }
 
   // z's drifting up through the empty jib space

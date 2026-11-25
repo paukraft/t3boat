@@ -74,6 +74,9 @@ impl Default for Settings {
 pub struct Spend {
     /// Id of the machine that ran on the sandbox.
     pub machine: String,
+    /// When it was looked up, unix seconds; 0 in older state files.
+    #[serde(default)]
+    pub at: i64,
     /// Start of the local day of the lookup, unix seconds.
     pub day: i64,
     /// Dollars since `day`.
