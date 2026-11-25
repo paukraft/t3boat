@@ -33,6 +33,9 @@ const OVERDUE_STOP_RETRY: Duration = Duration::from_secs(120);
 /// A running machine on older scripts takes this app's in place, retried this often.
 const UPGRADE_RETRY: Duration = Duration::from_secs(10 * 60);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(20);
+/// Preview tunnel traffic counts as use only this long after a person's last other action: a
+/// page left open (hot reload, polling) would otherwise keep the machine up all night.
+const TUNNEL_ATTENDED: Duration = Duration::from_secs(30 * 60);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// A requested sleep: the 45 s grace for the ack, a save called off earlier still running (up
@@ -183,6 +186,8 @@ pub struct MachineRuntime {
     /// One capture at a time: "sleep now" and the background poll can see the same drain.
     capturing: tokio::sync::Mutex<()>,
     last_heartbeat: Mutex<Option<Instant>>,
+    /// A person's last use, preview tunnel traffic aside.
+    last_user_action: Mutex<Option<Instant>>,
     /// When the watchdog was seen stopping the machine; cleared once Boat reports it stopped or
     /// the watchdog is active again.
     stop_seen: Mutex<Option<Instant>>,
@@ -212,6 +217,7 @@ impl MachineRuntime {
             waking: tokio::sync::Mutex::new(()),
             capturing: tokio::sync::Mutex::new(()),
             last_heartbeat: Mutex::new(None),
+            last_user_action: Mutex::new(None),
             stop_seen: Mutex::new(None),
             wake_failure: Mutex::new(None),
             save_failure: Mutex::new(None),
@@ -397,8 +403,9 @@ impl MachineRuntime {
     }
 
     /// Brings the machine up if needed and returns once its T3 server answers and will stay up.
-    /// Concurrent callers share one wake.
-    pub async fn ensure_awake(&self) -> Result<()> {
+    /// Concurrent callers share one wake. `why`: what needs it, logged when it wakes, as every wake
+    /// must be explainable.
+    pub async fn ensure_awake(&self, why: &str) -> Result<()> {
         let _guard = self.waking.lock().await;
         // Checked under the lock: a delete holding it retires the machine.
         if self.power() == Power::Missing {
@@ -424,6 +431,7 @@ impl MachineRuntime {
                 return Ok(());
             }
         }
+        tracing::info!("waking {} for {why}", self.id());
         let result = self.wake_locked().await;
         let was_failing = self.wake_failure.lock().unwrap().is_some();
         match &result {
@@ -626,9 +634,41 @@ impl MachineRuntime {
         self.save_cache();
     }
 
-    /// Someone used the machine: it stays awake, and recorded answers may be outdated.
+    /// Someone used the machine.
     pub fn user_action(self: &Arc<Self>) {
+        self.note_user_action();
+        self.used();
+    }
+
+    /// Someone is around, for the preview tunnel's traffic. Alone for use a sleeping machine takes
+    /// up only as it wakes (a message accepted meanwhile): until then its recorded answers still hold.
+    pub fn note_user_action(&self) {
+        *self.last_user_action.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Input through the preview tunnel: use while the person is around, never on its own.
+    pub fn tunnel_input(self: &Arc<Self>) {
+        if attended(*self.last_user_action.lock().unwrap()) {
+            self.used();
+        }
+    }
+
+    /// What the preview tunnel sends the page (server-sent events, hot reload): keeps the machine
+    /// awake while the person is around, but changes nothing its recorded answers hold.
+    pub fn tunnel_output(self: &Arc<Self>) {
+        if attended(*self.last_user_action.lock().unwrap()) {
+            self.stay_awake();
+        }
+    }
+
+    /// It stays awake, and recorded answers may be outdated.
+    fn used(self: &Arc<Self>) {
         self.cache.lock().unwrap().bump_epoch();
+        self.stay_awake();
+    }
+
+    /// A heartbeat to the watchdog, at most one per `HEARTBEAT_EVERY`.
+    fn stay_awake(self: &Arc<Self>) {
         if self.power() != Power::Running {
             return;
         }
@@ -717,7 +757,7 @@ impl MachineRuntime {
         if minutes == Some(0) && !self.awake_now().await? {
             return Ok(());
         }
-        self.ensure_awake().await?;
+        self.ensure_awake("keep awake").await?;
         let body = json!({ "minutes": minutes });
         let s = match self.watchdog_post("/keep-awake", body.clone()).await {
             Ok(s) => s,
@@ -727,7 +767,7 @@ impl MachineRuntime {
                 if minutes == Some(0) {
                     return Ok(());
                 }
-                self.ensure_awake().await?;
+                self.ensure_awake("keep awake").await?;
                 self.watchdog_post("/keep-awake", body).await?
             }
             Err(e) => return Err(e),
@@ -765,7 +805,7 @@ impl MachineRuntime {
         let slept = self.slept().await;
         match hold {
             Some(minutes) => self.keep_awake(minutes).await?,
-            None if slept => self.ensure_awake().await?,
+            None if slept => self.ensure_awake("a resize").await?,
             None => {}
         }
         Ok(())
@@ -925,7 +965,7 @@ impl MachineRuntime {
         if unprimed {
             // Without these T3 Code cannot even connect while the machine sleeps.
             let primed = async {
-                self.ensure_awake().await?;
+                self.ensure_awake("its first connection details").await?;
                 self.prime().await
             };
             if let Err(e) = primed.await {
@@ -978,8 +1018,7 @@ impl MachineRuntime {
                 // puts the machine back to sleep after the usual delay. With this app not
                 // running that long, the machine is restored from its snapshot instead.
                 last_keep_alive = Some(Instant::now());
-                tracing::info!("keep-alive wake for {}", self.id());
-                if let Err(e) = self.ensure_awake().await {
+                if let Err(e) = self.ensure_awake("keep-alive").await {
                     tracing::warn!("keep-alive wake for {}: {e:#}", self.id());
                 }
             }
@@ -988,9 +1027,9 @@ impl MachineRuntime {
                 && last_due_wake.is_none_or(|t| t.elapsed() >= DUE_WAKE_RETRY)
             {
                 last_due_wake = Some(Instant::now());
-                tracing::info!("waking {} for work due", self.id());
-                if let Err(e) = self.ensure_awake().await {
-                    tracing::warn!("waking {} for work due: {e:#}", self.id());
+                let why = if due { "work due" } else { "a message sent while asleep" };
+                if let Err(e) = self.ensure_awake(why).await {
+                    tracing::warn!("waking {} for {why}: {e:#}", self.id());
                 }
             }
             if let Some((sandbox, stop)) = self.begin_save() {
@@ -1094,5 +1133,22 @@ impl MachineRuntime {
             && self.cache.lock().unwrap().deferred_commands.iter().any(|c| {
                 c["type"].as_str().is_some_and(|k| classify::WAKING_COMMANDS.contains(&k))
             })
+    }
+}
+
+fn attended(last_user_action: Option<Instant>) -> bool {
+    last_user_action.is_some_and(|t| t.elapsed() < TUNNEL_ATTENDED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tunnel_traffic_counts_only_while_someone_is_around() {
+        let ago = |minutes: u64| Instant::now().checked_sub(Duration::from_secs(minutes * 60));
+        assert!(!attended(None));
+        assert!(attended(ago(29)));
+        assert!(!attended(ago(31)));
     }
 }

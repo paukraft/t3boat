@@ -49,6 +49,8 @@ pub async fn serve(machine: Arc<MachineRuntime>) -> Result<()> {
         .route("/ws", get(ws))
         .route("/api/device-hub/{*path}", any(media::stream))
         .route("/api/preview-stream/{*path}", any(media::stream))
+        .route("/api/preview/tunnel", get(media::tunnel))
+        .route("/ws/voice", get(media::voice))
         .route("/oauth/mcp/register", post(link::register))
         .route("/oauth/mcp/decision", post(link::decision))
         .route("/oauth/mcp/token", post(link::token))
@@ -308,11 +310,11 @@ struct Relay {
     wake: bool,
 }
 
-/// Everything without a route of its own. Its sockets (dictation, and whatever T3 adds) are
-/// opened by a person, so they wake the machine.
+/// Everything without a route of its own. Its sockets are whatever T3 adds: one T3 Code opens on
+/// its own and retries would keep the machine from sleeping, so they never wake it.
 async fn fallback(State(m): M, upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>, req: Request) -> Response {
     match upgrade {
-        Ok(upgrade) => media::socket(m, upgrade, &req.into_parts().0, true).await,
+        Ok(upgrade) => media::socket(m, upgrade, &req.into_parts().0, media::Asleep::Unavailable).await,
         Err(_) => forward(State(m), req).await,
     }
 }
@@ -402,24 +404,28 @@ async fn relay(m: &MachineRuntime, parts: Parts, body: Body, route: Relay) -> Re
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     };
-    let mut out = Response::builder().status(res.status());
-    for (k, v) in res.headers() {
+    answer_head(res.status(), res.headers())
+        .body(Body::from_stream(res.bytes_stream()))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// The machine's answer as T3 Code gets it: its status and end-to-end headers.
+fn answer_head(status: StatusCode, headers: &HeaderMap) -> axum::http::response::Builder {
+    let mut out = Response::builder().status(status);
+    for (k, v) in headers {
         if !HOP_BY_HOP.contains(&k.as_str()) {
             out = out.header(k, v);
         }
     }
-    out.body(Body::from_stream(res.bytes_stream()))
-        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+    out
 }
 
 /// Wakes the machine for a request that may, and answers 503 for one that may not.
-/// `why`: what woke it, logged, as every wake must be explainable.
 async fn wake(m: &MachineRuntime, allowed: bool, why: &str) -> Result<(), Response> {
     if !allowed {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
-    tracing::info!("waking {} for {why}", m.id());
-    m.ensure_awake()
+    m.ensure_awake(why)
         .await
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response())
 }

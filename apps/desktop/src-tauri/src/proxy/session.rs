@@ -51,6 +51,8 @@ enum Internal {
     Settled(Power),
     Woke(Result<()>),
     Connected(Result<upstream::Upstream>),
+    /// Connecting failed; the machine's power when checked after.
+    ConnectFailed(Power),
     Up(Option<String>),
     /// The upstream socket is gone; the machine's power when checked after.
     UpstreamLost(Power),
@@ -220,7 +222,7 @@ impl Session {
             Phase::Live if action && self.m.is_stopping() => {
                 self.fail_upstream().await?;
                 self.held.push(req);
-                self.wake();
+                self.wake(tag);
             }
             Phase::Live => self.forward(req),
             Phase::Asleep => self.on_asleep(req).await?,
@@ -240,8 +242,7 @@ impl Session {
         }
         let tag = req["tag"].as_str().unwrap_or_default();
         if !classify::is_side_info(tag, &req["payload"]) {
-            tracing::info!("waking {} for {tag}", self.m.id());
-            self.wake();
+            self.wake(tag.to_owned());
         }
         self.held.push(req);
         Ok(())
@@ -346,9 +347,9 @@ impl Session {
                 }
                 self.m.cache.lock().unwrap().deferred_commands.push(payload.clone());
                 self.m.save_cache();
+                self.m.note_user_action();
                 if wakes {
-                    tracing::info!("waking {} for {kind}", self.m.id());
-                    self.wake();
+                    self.wake(kind.to_owned());
                 }
                 Some(vec![exit_success(id, json!({"sequence": capture.sequence}))])
             }
@@ -365,7 +366,8 @@ impl Session {
         }
     }
 
-    fn wake(&mut self) {
+    /// `why`: the request that needs the machine.
+    fn wake(&mut self, why: String) {
         if matches!(self.phase, Phase::Waking | Phase::Connecting) {
             return;
         }
@@ -373,7 +375,20 @@ impl Session {
         let m = self.m.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(Internal::Woke(m.ensure_awake().await));
+            let _ = tx.send(Internal::Woke(m.ensure_awake(&why).await));
+        });
+    }
+
+    /// Asks Boat how the machine is, off the loop, and waits out a stop: the power known here may
+    /// be stale (the app just started, the machine stopped since).
+    fn recheck_power(&mut self, then: fn(Power) -> Internal) {
+        self.phase = Phase::Settling;
+        let m = self.m.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let power = m.refresh_power().await.unwrap_or(Power::Unknown);
+            let power = if matches!(power, Power::Stopping | Power::Stopped) { m.settled_power().await } else { power };
+            let _ = tx.send(then(power));
         });
     }
 
@@ -426,10 +441,17 @@ impl Session {
                 if self.connect_attempts >= MAX_CONNECT_ATTEMPTS {
                     return Ok(Some("machine unreachable".into()));
                 }
-                // Asleep after all, or not ready yet: a wake sorts out both.
-                self.phase = Phase::Asleep;
-                self.wake();
+                self.recheck_power(Internal::ConnectFailed);
             }
+            // Not ready yet, or Boat moved its address: a wake sorts out both, and returns at
+            // once if neither.
+            Internal::ConnectFailed(Power::Running) => self.wake("a T3 Code connection".into()),
+            // Boat didn't answer either: T3 Code reconnects, and the new session looks again.
+            // Taken for asleep, it would answer from the cache while the machine runs.
+            Internal::ConnectFailed(Power::Unknown) => return Ok(Some("machine unreachable".into())),
+            // Asleep after all, maybe stopping when last seen running: only what is held may
+            // wake it.
+            Internal::ConnectFailed(_) => self.go_asleep().await?,
             Internal::Up(Some(text)) => return self.on_up(&text).await,
             Internal::Up(None) => return self.on_upstream_lost().await,
             Internal::UpstreamLost(power) => return self.after_upstream_lost(power).await,
@@ -583,14 +605,7 @@ impl Session {
             // A wake of ours is under way and will reconnect.
             return Ok(None);
         }
-        self.phase = Phase::Settling;
-        let m = self.m.clone();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let power = m.refresh_power().await.unwrap_or(Power::Unknown);
-            let power = if matches!(power, Power::Stopping | Power::Stopped) { m.settled_power().await } else { power };
-            let _ = tx.send(Internal::UpstreamLost(power));
-        });
+        self.recheck_power(Internal::UpstreamLost);
         Ok(None)
     }
 

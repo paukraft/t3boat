@@ -45,7 +45,7 @@ impl Agent {
 
 impl MachineRuntime {
     pub async fn sign_in(&self, agent: Agent) -> Result<()> {
-        self.ensure_awake().await?;
+        self.ensure_awake("an agent sign-in").await?;
         let id = self.sandbox_id();
         let boat = &self.shared.boat;
         // The CLI hands the sign-in URL to $BROWSER; this one records it instead.
