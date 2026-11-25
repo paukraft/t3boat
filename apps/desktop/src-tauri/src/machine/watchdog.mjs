@@ -14,10 +14,10 @@
 // stops the machine while it runs: one called off by use runs on, and could finish after the app's.
 
 import { createServer } from "node:http";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { availableParallelism, homedir } from "node:os";
+import { availableParallelism, homedir, userInfo } from "node:os";
 import { join } from "node:path";
 
 const HOME = homedir();
@@ -27,6 +27,11 @@ const KEEP_AWAKE_PATH = join(HOME, ".t3boat", "keep-awake-until");
 const MAX_KEEP_AWAKE_MINUTES = 24 * 60;
 const DB_PATH = join(HOME, ".t3", "userdata", "statev2.sqlite");
 const T3_ORIGIN = "http://127.0.0.1:3773";
+const SETTINGS_PATH = join(HOME, ".t3", "userdata", "settings.json");
+// provision.sh's: Claude with Boat's Claude credential.
+const CLAUDE_LAUNCHER = join(HOME, ".t3boat", "claude");
+// Boat changes the credential whenever the account's changes, and on every resume.
+const CLAUDE_ROUTE_EVERY_MS = 60_000;
 const PORT = 3774;
 const TICK_MS = 5_000;
 // The app's ack can take a poll, a capture of up to 12 s and the post. A miss costs a ~2 min save
@@ -475,15 +480,66 @@ function stopFailedNow() {
   phase = "draining";
 }
 
+let claudeRoutedAt = 0;
+let claudeRouting = false;
+/**
+ * T3 starts Claude through the launcher only while a clean login shell gets a Claude credential
+ * from Boat (Boat's loader leaves none when Claude has its own login on the machine): T3 offers
+ * its Update button only for Claude's own binary. Set as the default Claude instance's binary
+ * path in T3's settings, which T3 reloads as they change; a path set otherwise stays.
+ */
+function routeClaude() {
+  if (claudeRouting) return;
+  claudeRouting = true;
+  claudeRoutedAt = Date.now();
+  const user = userInfo().username;
+  const probe =
+    'for n in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CODE_OAUTH_TOKEN; do [ -z "${!n-}" ] || exit 0; done; exit 3';
+  const env = [`HOME=${HOME}`, `USER=${user}`, `LOGNAME=${user}`, "SHELL=/bin/bash", "PATH=/usr/local/bin:/usr/bin:/bin"];
+  execFile("env", ["-i", ...env, "bash", "-lc", probe], { timeout: 10_000 }, (err) => {
+    claudeRouting = false;
+    // A login shell that failed or hung tells nothing: left as it is.
+    if (err && err.code !== 3) return log("Claude credential check failed", err.message);
+    try {
+      setClaudeBinary(!err);
+    } catch (e) {
+      log("Claude binary path not set", e.message);
+    }
+  });
+}
+
+function setClaudeBinary(launcher) {
+  let settings = {};
+  let mode = 0o600;
+  try {
+    settings = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
+    mode = statSync(SETTINGS_PATH).mode & 0o777;
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
+  const instances = settings.providerInstances ?? {};
+  const claude = instances.claudeAgent ?? { driver: "claudeAgent" };
+  const { binaryPath, ...config } = claude.config ?? {};
+  if (launcher ? binaryPath : binaryPath !== CLAUDE_LAUNCHER) return;
+  instances.claudeAgent = { ...claude, config: launcher ? { ...config, binaryPath: CLAUDE_LAUNCHER } : config };
+  settings.providerInstances = instances;
+  // Renamed into place: T3 never reads it half written.
+  writeFileSync(`${SETTINGS_PATH}.t3boat`, JSON.stringify(settings, null, 2), { mode });
+  renameSync(`${SETTINGS_PATH}.t3boat`, SETTINGS_PATH);
+  log(launcher ? "Claude starts with Boat's credential" : "Claude starts on its own");
+}
+
 async function tick() {
   const now = Date.now();
   // A drain begun during this tick's checks (by "Sleep now") waits for the next tick's.
   const drainBefore = drainStartedAt;
-  if (now - lastTickAt > RESUMED_GAP_MS) {
+  const resumed = now - lastTickAt > RESUMED_GAP_MS;
+  if (resumed) {
     setKeepAwake(0);
     touch("resumed");
   }
   lastTickAt = now;
+  if (resumed || now - claudeRoutedAt >= CLAUDE_ROUTE_EVERY_MS) routeClaude();
   if (phase === "stopping") {
     if (now - stopRequestedAt > STOP_SETTLE_MS) stopFailedNow();
     return;
@@ -599,6 +655,7 @@ const server = createServer(async (req, res) => {
       if (resumed) {
         setKeepAwake(0);
         touch("resumed");
+        routeClaude();
         return reply(200, status());
       }
       // Too late to call off a stop: the proxy waits for it and resumes the machine.

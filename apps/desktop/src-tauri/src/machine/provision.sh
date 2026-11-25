@@ -48,6 +48,42 @@ if [ "$(cat /etc/machine-info 2>/dev/null || true)" != "$machine_info" ]; then
   echo "$machine_info" | sudo tee /etc/machine-info >/dev/null
   restart_t3=1
 fi
+# Boat's Claude credential (Agents & Proxying) reaches login shells only: Boat keeps it in
+# /run/ascii-secrets/env.sh, which ~/.bashrc sources, and changes it whenever the account's does.
+# T3 runs as a service, so while Boat has one for Claude, the watchdog has T3 start Claude through
+# this launcher, which takes what a clean login shell has each time: the same as `claude` over SSH,
+# Boat's loader rules included (Claude's own login on the machine wins), and current without
+# restarting T3. Swapped in by a rename, so a Claude start never finds it half written and a
+# launcher running meanwhile keeps reading the old one.
+install -m 700 /dev/stdin "$boat_dir/claude.next" <<'SH'
+#!/usr/bin/env bash
+# T3's Claude: `claude` from PATH (this file isn't on it), with the Claude credential a clean login
+# shell gets from Boat. Only variables the login shell sets are added; a failed or slow one adds none.
+# A Claude instance in T3 with its own credential or login keeps it, even one set empty.
+[ -z "${ANTHROPIC_API_KEY+x}${ANTHROPIC_AUTH_TOKEN+x}${ANTHROPIC_BASE_URL+x}${CLAUDE_CODE_OAUTH_TOKEN+x}${CLAUDE_CONFIG_DIR+x}" ] ||
+  exec claude "$@"
+# Values come back NUL-separated, so any value is safe, in a file: a pipe could be held open by
+# something the profile starts in the background. Unlinked at once, so a killed launcher leaves none.
+# The profile's own output goes nowhere.
+values="$(mktemp "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/t3boat-claude.XXXXXX" 2>/dev/null)" || exec claude "$@"
+exec 3>"$values" 4<"$values"
+rm -f "$values"
+user="$(id -un)"
+if timeout -k 1 10 env -i HOME="$HOME" USER="$user" LOGNAME="$user" SHELL=/bin/bash PATH=/usr/local/bin:/usr/bin:/bin \
+  bash -lc 'for n in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CODE_OAUTH_TOKEN; do
+    [ -z "${!n-}" ] || printf "%s=%s\0" "$n" "${!n}" >&3
+  done' 4<&- </dev/null >/dev/null 2>&1; then
+  # The profile has fd 3 too: only these four are taken from it.
+  while IFS= read -r -d '' pair; do
+    case "${pair%%=*}" in
+      ANTHROPIC_API_KEY | ANTHROPIC_AUTH_TOKEN | ANTHROPIC_BASE_URL | CLAUDE_CODE_OAUTH_TOKEN) export "$pair" ;;
+    esac
+  done <&4
+fi
+exec 3>&- 4<&-
+exec claude "$@"
+SH
+mv -f "$boat_dir/claude.next" "$boat_dir/claude"
 if [ "$live" = 0 ]; then
   "$t3" service install --allow-downgrade >/dev/null
   systemctl --user daemon-reload
