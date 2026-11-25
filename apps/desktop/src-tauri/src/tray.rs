@@ -467,19 +467,36 @@ fn get_machine_details(ui: State<'_, Ui>, id: String) -> Res<app::MachineDetails
     ui.app()?.details(&id).map_err(err)
 }
 
-/// Signs an agent in on the machine through the vendor's own login in the browser.
+/// Signs an agent in on the machine through the vendor's own login in the browser. False when
+/// the user cancelled it.
 #[tauri::command]
-async fn sign_in_agent(ui: State<'_, Ui>, id: String, agent: String) -> Res {
-    let agent = crate::machine::signin::Agent::from_name(&agent)
-        .ok_or_else(|| format!("{agent} has to be signed in from T3 Code's settings"))?;
-    ui.app()?.machine(&id).map_err(err)?.sign_in(agent).await.map_err(err)
+async fn sign_in_agent(ui: State<'_, Ui>, id: String, instance_id: String) -> Res<bool> {
+    let agent = crate::machine::signin::Agent::from_instance(&instance_id)
+        .ok_or("this agent has to be signed in from T3 Code's settings")?;
+    finished(ui.app()?.machine(&id).map_err(err)?.sign_in(agent).await)
 }
 
 /// Turns on T3 Connect there; resolves once other devices can reach it, after the user signed in
-/// to their T3 account in the browser.
+/// to their T3 account in the browser. False when the user cancelled it.
 #[tauri::command]
-async fn turn_on_connect(ui: State<'_, Ui>, id: String) -> Res {
-    ui.app()?.machine(&id).map_err(err)?.turn_on_connect().await.map_err(err)
+async fn turn_on_connect(ui: State<'_, Ui>, id: String) -> Res<bool> {
+    finished(ui.app()?.machine(&id).map_err(err)?.turn_on_connect().await)
+}
+
+/// Ends the sign-in running there: its command resolves false.
+#[tauri::command]
+fn cancel_login(ui: State<'_, Ui>, id: String) -> Res {
+    ui.app()?.machine(&id).map_err(err)?.cancel_login();
+    Ok(())
+}
+
+/// A sign-in's outcome: done, or cancelled by the user.
+fn finished(result: anyhow::Result<()>) -> Res<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(e) if e.is::<crate::machine::login::Cancelled>() => Ok(false),
+        Err(e) => Err(err(e)),
+    }
 }
 
 /// "Keep awake" for `minutes`; null: until stopped; 0 ends it.
@@ -608,6 +625,7 @@ pub fn run() {
             keep_awake,
             sign_in_agent,
             turn_on_connect,
+            cancel_login,
             get_machine_details,
             latest_thread,
             update_settings,

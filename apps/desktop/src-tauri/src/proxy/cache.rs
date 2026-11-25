@@ -235,9 +235,8 @@ impl Cache {
             .for_each(|(_, r)| record_config_event(&mut r.value, &event));
     }
 
-    /// The machine's enabled agent providers whose sign-in is known, per its last config: name
-    /// and whether signed in.
-    pub fn agents(&self) -> Vec<(String, bool)> {
+    /// The machine's enabled agent providers, per its last config.
+    pub fn agents(&self) -> Vec<AgentProvider> {
         self.streams
             .iter()
             .filter(|(k, _)| k.starts_with("subscribeServerConfig "))
@@ -248,15 +247,23 @@ impl Cache {
             .flatten()
             .filter(|p| p["enabled"] == true)
             .filter_map(|p| {
-                let signed_in = match p["auth"]["status"].as_str()? {
-                    "authenticated" => true,
-                    "unauthenticated" => false,
-                    _ => return None,
-                };
-                Some((p["displayName"].as_str()?.to_owned(), signed_in))
+                Some(AgentProvider {
+                    instance_id: p["instanceId"].as_str()?.to_owned(),
+                    name: p["displayName"].as_str()?.to_owned(),
+                    status: p["auth"]["status"].as_str().unwrap_or("unknown").to_owned(),
+                })
             })
             .collect()
     }
+}
+
+/// An agent provider as T3 lists it. Only `instance_id` is stable: `name` is the user's to edit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentProvider {
+    pub instance_id: String,
+    pub name: String,
+    /// T3's auth status: "authenticated", "unauthenticated" or "unknown".
+    pub status: String,
 }
 
 pub fn cache_path(machine_dir: &Path) -> PathBuf {
@@ -445,7 +452,10 @@ mod tests {
         let providers = &items[0]["config"]["providers"];
         assert_eq!(providers[0]["models"], json!([1]));
         assert_eq!(providers[1]["instanceId"], "b");
-        assert_eq!(c.agents(), vec![("a".to_owned(), false), ("b".to_owned(), true)]);
+        assert_eq!(
+            c.agents()[0],
+            AgentProvider { instance_id: "a".into(), name: "a".into(), status: "unauthenticated".into() }
+        );
     }
 
     #[test]
@@ -454,10 +464,11 @@ mod tests {
         let snapshot =
             json!({"type": "snapshot", "config": {"providers": [provider("a", "unauthenticated", json!([]))]}});
         c.record_stream_items("subscribeServerConfig", CONFIG, &[snapshot], true);
+        let status = |c: &Cache| c.agents()[0].status.clone();
         c.fold_providers(&Value::Null);
-        assert_eq!(c.agents(), vec![("a".to_owned(), false)]);
+        assert_eq!(status(&c), "unauthenticated");
         c.fold_providers(&json!([provider("a", "authenticated", json!([]))]));
-        assert_eq!(c.agents(), vec![("a".to_owned(), true)]);
+        assert_eq!(status(&c), "authenticated");
     }
 
     #[test]

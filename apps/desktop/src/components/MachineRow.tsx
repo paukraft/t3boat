@@ -1,7 +1,20 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { MachineView, Size } from "../types";
-import { ACTIONS, machineKey, menuActions, needsProject, primaryAction, seedOf, signInTo, type Action, type MenuItem } from "../machine";
-import { AgentName, AgentNames } from "./AgentLogos";
+import {
+  ACTIONS,
+  canCancelLogin,
+  loginStep,
+  machineKey,
+  menuActions,
+  needsProject,
+  primaryAction,
+  seedOf,
+  signInTo,
+  type Action,
+  type LoginAction,
+  type MenuItem,
+} from "../machine";
+import { AgentName } from "./AgentLogos";
 import { BoatIcon } from "./BoatIcon";
 import { DeleteErrorNote, Dots, useArmed, useDetail } from "./common";
 import { Icon } from "./Icons";
@@ -14,6 +27,8 @@ interface Props {
   /** why the last delete was refused (work still running) */
   deleteError: string | null;
   onAction: (a: Action) => void;
+  onLogin: (l: LoginAction) => void;
+  onCancelLogin: () => void;
   onDismissDeleteError: () => void;
   onHover: (key: string | null) => void;
   /** open this machine's details (`pickProject`: with the project picker open); omitted while it can't have any */
@@ -26,6 +41,8 @@ export function MachineRow({
   pending,
   deleteError,
   onAction,
+  onLogin,
+  onCancelLogin,
   onDismissDeleteError,
   onHover,
   onOpen,
@@ -34,7 +51,8 @@ export function MachineRow({
   const primary = primaryAction(m);
   const detail = useDetail(m);
   const extra = menuActions(m, sizes);
-  const signedOut = m.agents.filter((a) => !a.signedIn).map((a) => a.name);
+  // no agent is signed in there: those t3boat can sign in
+  const toSignIn = m.needsSignIn ? m.agents.filter((a) => a.canSignIn) : [];
   const [armed, arm] = useArmed(); // two-step confirm for the primary "Remove"
   // "Add a project…" picks from T3 Code's projects in the details view
   const menuAction = (a: MenuItem) => ("kind" in a ? onOpen?.(true) : onAction(a));
@@ -104,18 +122,37 @@ export function MachineRow({
           </button>
         </div>
       ) : null}
-      {m.id && signedOut.length ? (
+      {m.login ? (
+        <div className="row-note">
+          <Dots />
+          <span className="row-note-text">
+            <AgentName name={m.login.name} /> sign-in · {loginStep(m.login)}
+          </span>
+          {canCancelLogin(m.login) ? (
+            <button className="btn btn-link" onClick={onCancelLogin}>
+              Cancel
+            </button>
+          ) : null}
+        </div>
+      ) : m.id && m.state !== "missing" && toSignIn.length ? (
         <div className="row-note">
           <span className="row-note-text">
-            <AgentNames names={signedOut} /> {signedOut.length === 1 ? "needs" : "need"} a sign-in
+            {toSignIn.length === 1 ? (
+              <>
+                <AgentName name={toSignIn[0].name} /> needs a sign-in
+              </>
+            ) : (
+              "No agent is signed in"
+            )}
           </span>
-          {signedOut.map((agent) => (
-            <button key={agent} className="btn btn-link" disabled={!!pending} onClick={() => onAction(signInTo(agent))}>
-              {signedOut.length > 1 ? <AgentName name={agent} /> : "Sign in"}
+          {toSignIn.map((agent) => (
+            <button key={agent.instanceId} className="btn btn-link" disabled={!!pending} onClick={() => onLogin(signInTo(agent))}>
+              {toSignIn.length > 1 ? <AgentName name={agent.name} /> : "Sign in"}
             </button>
           ))}
         </div>
-      ) : needsProject(m) && onOpen ? (
+      ) : null}
+      {needsProject(m) && onOpen ? (
         <div className="row-note">
           <span className="row-note-text">No projects yet</span>
           <button className="btn btn-link" onClick={() => onOpen(true)}>

@@ -1,4 +1,4 @@
-import type { MachineState, MachineView, Size } from "./types";
+import type { AgentRef, MachineLogin, MachineState, MachineView, Size } from "./types";
 
 const TAGS: Record<MachineState, string> = {
   working: "working",
@@ -30,12 +30,10 @@ export type Action = {
   solid?: boolean;
 } & (
   | { cmd: "open_machine"; thread?: string }
-  | { cmd: "pair_machine" | "wake_machine" | "sleep_machine" | "turn_on_connect" }
+  | { cmd: "pair_machine" | "wake_machine" | "sleep_machine" }
   | { cmd: "resize_machine"; size: string }
   /** null = until stopped (auto sleep off), 0 ends it */
   | { cmd: "keep_awake"; minutes: number | null }
-  /** the agent's name as `agents` lists it */
-  | { cmd: "sign_in_agent"; agent: string }
   /** discard: delete even while work runs on it */
   | { cmd: "delete_machine"; discard: boolean }
 );
@@ -45,12 +43,23 @@ export const PICK_PROJECT = { kind: "pickProject", label: "Add a project…" } a
 
 export type MenuItem = Action | typeof PICK_PROJECT;
 
-export const signInTo = (agent: string): Action => ({
-  cmd: "sign_in_agent",
-  label: `Sign in ${agent}`,
-  busy: "Signing in…",
-  agent,
-});
+/** A browser sign-in on the machine: not a tracked action, it shows as the machine's `login`. */
+export type LoginAction = { cmd: "sign_in_agent"; agent: AgentRef } | { cmd: "turn_on_connect" };
+
+export const signInTo = (agent: AgentRef): LoginAction => ({ cmd: "sign_in_agent", agent });
+export const TURN_ON_CONNECT: LoginAction = { cmd: "turn_on_connect" };
+
+const LOGIN_STEPS: Record<MachineLogin["step"], string> = {
+  waking: "Waking…",
+  starting: "Opening sign-in…",
+  browser: "Approve in browser…",
+  finishing: "Finishing…",
+};
+
+export const loginStep = (l: MachineLogin) => LOGIN_STEPS[l.step];
+
+/** Past the browser, the sign-in is put to use and can no longer be cancelled. */
+export const canCancelLogin = (l: MachineLogin) => l.step !== "finishing";
 
 export const ACTIONS = {
   pair: { cmd: "open_machine", label: "Add to T3 Code", busy: "Sending…", solid: true },
@@ -58,7 +67,6 @@ export const ACTIONS = {
   wake: { cmd: "wake_machine", label: "Wake now", busy: "Waking…" },
   retry: { cmd: "wake_machine", label: "Try again", busy: "Waking…" },
   sleep: { cmd: "sleep_machine", label: "Sleep now", busy: "Sleeping…" },
-  connect: { cmd: "turn_on_connect", label: "Turn on", busy: "Approve in browser…" },
   remove: { cmd: "delete_machine", label: "Remove", busy: "Removing…", discard: true },
   del: { cmd: "delete_machine", label: "Delete", busy: "Deleting…", discard: false },
   deleteAnyway: { cmd: "delete_machine", label: "Delete anyway", busy: "Deleting…", discard: true },

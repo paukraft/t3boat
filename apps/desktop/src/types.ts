@@ -22,6 +22,8 @@ export interface MachineView {
   countdown: Countdown | null; // set while `detail` counts down
   paired: boolean;
   agents: AgentLogin[]; // its agents whose sign-in is known
+  needsSignIn: boolean; // no agent there is signed in: offer a sign-in for those it `canSignIn`
+  login: MachineLogin | null; // a browser sign-in t3boat runs there
   t3Version: string; // "" while unknown
   projects: MachineProject[]; // its T3 projects as last seen (never wakes it), then those being added
   keepAwakeUntil: number | null; // when a "keep awake" runs out (unix ms); null when off or until stopped
@@ -30,9 +32,23 @@ export interface MachineView {
   connect: boolean; // T3 Connect is on: the user's other devices reach it with their T3 account
 }
 
-export interface AgentLogin {
+/** An agent provider on a machine: T3's `instanceId` picks it, its display `name` (the user's to edit) shows it. */
+export interface AgentRef {
+  instanceId: string;
   name: string;
+}
+
+export interface AgentLogin extends AgentRef {
   signedIn: boolean;
+  canSignIn: boolean; // t3boat can sign it in there (T3's default Claude and Codex)
+}
+
+/** A sign-in t3boat runs on a machine: an agent's (`instanceId` as in `agents`), or T3 Connect's (`instanceId` null). */
+export interface MachineLogin {
+  instanceId: string | null;
+  name: string; // the agent's display name, or "T3 Connect"
+  // browser: its page is open, the user approves it there; finishing: signed in, no longer cancellable
+  step: "waking" | "starting" | "browser" | "finishing";
 }
 
 export interface MachineProject {
@@ -105,8 +121,9 @@ export interface Commands {
   delete_machine: [{ id: string; discard?: boolean }, void];
   resize_machine: [{ id: string; size: string }, void];
   keep_awake: [{ id: string; minutes: number | null }, void]; // null: until stopped; 0: stop
-  sign_in_agent: [{ id: string; agent: string }, void];
-  turn_on_connect: [{ id: string }, void]; // resolves once reachable, after the browser sign-in
+  sign_in_agent: [{ id: string; instanceId: string }, boolean]; // false: cancelled
+  turn_on_connect: [{ id: string }, boolean]; // resolves once reachable, after the browser sign-in; false: cancelled
+  cancel_login: [{ id: string }, void];
   latest_thread: [{ id: string }, string | null]; // thread id
   get_machine_details: [{ id: string }, MachineDetails];
   add_mcp: [{ client: McpClient }, void];

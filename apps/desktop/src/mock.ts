@@ -5,18 +5,28 @@
 // ?ready=1 (a new machine comes up in T3 Code with its agents signed in and acme on it, as the website shows it)
 import type { Backend } from "./api";
 import { timeLapse } from "./pixel/clock";
-import type { AgentLogin, CommandArgs, CommandName, LocalProject, MachineDetails, MachineProject, MachineView, Setup, UiState } from "./types";
+import type { CommandArgs, CommandName, LocalProject, MachineDetails, MachineProject, MachineView, Setup, UiState } from "./types";
 
 const params = new URLSearchParams(location.search);
 
-type Seed = Omit<MachineView, "wakeError" | "countdown" | "agents" | "t3Version" | "projects" | "keepAwakeUntil" | "keepAwakeForever" | "waiting" | "connect"> &
-  Partial<Pick<MachineView, "wakeError" | "countdown" | "agents" | "projects" | "connect">>;
-/** Claude and Codex, signed in or not. */
-const agents = (signedIn: boolean): AgentLogin[] => ["Claude", "Codex"].map((name) => ({ name, signedIn }));
+type Seed = Omit<
+  MachineView,
+  "wakeError" | "countdown" | "agents" | "needsSignIn" | "login" | "t3Version" | "projects" | "keepAwakeUntil" | "keepAwakeForever" | "waiting" | "connect"
+> &
+  Partial<Pick<MachineView, "wakeError" | "countdown" | "agents" | "needsSignIn" | "projects" | "connect">>;
+/** T3's default Claude and Codex instances (those t3boat signs in), both signed in or neither. */
+const agents = (signedIn: boolean): Pick<MachineView, "agents" | "needsSignIn"> => ({
+  agents: [
+    { instanceId: "claudeAgent", name: "Claude", signedIn, canSignIn: true },
+    { instanceId: "codex", name: "Codex", signedIn, canSignIn: true },
+  ],
+  needsSignIn: !signedIn,
+});
 const machine = (m: Seed): MachineView => ({
   wakeError: null,
   countdown: null,
-  agents: agents(true),
+  ...agents(true),
+  login: null,
   t3Version: "0.0.21",
   projects: [],
   keepAwakeUntil: null,
@@ -70,7 +80,7 @@ const seedMachines: MachineView[] = [
     state: "idle",
     ...idle(),
     paired: true,
-    agents: agents(false),
+    ...agents(false),
   }),
   machine({ id: "sb_02bb", name: "scratch", size: "small", state: "idle", detail: "Idle · not in T3 Code yet", paired: false }),
 ];
@@ -166,6 +176,23 @@ function create(): MockBackend {
     return m;
   };
 
+  /** Each machine's latest sign-in: a cancelled one's steps must not run on into the next. */
+  const logins = new Map<string, symbol>();
+  /** A browser sign-in as the backend runs it: waking, its page opening, the user approving, putting it to use. False once cancelled. */
+  const browserLogin = async (id: string, instanceId: string | null, name: string) => {
+    const running = find(id).login;
+    if (running) throw `the ${running.name} sign-in is still open there; finish or cancel it first`;
+    const mine = Symbol();
+    logins.set(id, mine);
+    for (const [step, ms] of [["waking", 1200], ["starting", 800], ["browser", 3000], ["finishing", 1000]] as const) {
+      patch(id, { login: { instanceId, name, step } });
+      await wait(ms);
+      if (!find(id).login || logins.get(id) !== mine) return false;
+    }
+    patch(id, { login: null });
+    return true;
+  };
+
   const setupOrder: Setup[] = ["installBoat", "signInBoat", "installT3", "ready"];
 
   const handlers: { [C in CommandName]: (a: CommandArgs<C>) => Promise<unknown> } = {
@@ -192,7 +219,7 @@ function create(): MockBackend {
               ...idle(),
               ...(params.get("ready") === "1"
                 ? { paired: true, projects: projects?.length ? [] : [onMachine("acme", "github.com/you/acme")] }
-                : { agents: agents(false) }),
+                : agents(false)),
             }
           : m,
       );
@@ -266,13 +293,24 @@ function create(): MockBackend {
     },
 
     async turn_on_connect({ id }) {
-      await wait(4000);
+      if (!(await browserLogin(id, null, "T3 Connect"))) return false;
       patch(id, { connect: true });
+      return true;
     },
 
-    async sign_in_agent({ id, agent }) {
-      await wait(3000);
-      patch(id, { agents: find(id).agents.map((a) => (a.name === agent ? { ...a, signedIn: true } : a)) });
+    async sign_in_agent({ id, instanceId }) {
+      const agent = find(id).agents.find((a) => a.instanceId === instanceId && a.canSignIn);
+      if (!agent) throw "this agent has to be signed in from T3 Code's settings";
+      if (!(await browserLogin(id, instanceId, agent.name))) return false;
+      patch(id, {
+        agents: find(id).agents.map((a) => (a.instanceId === instanceId ? { ...a, signedIn: true } : a)),
+        needsSignIn: false,
+      });
+      return true;
+    },
+
+    async cancel_login({ id }) {
+      if (find(id).login) patch(id, { login: null });
     },
 
     async open_machine({ id }) {
@@ -282,7 +320,7 @@ function create(): MockBackend {
         patch(id, { paired: true, ...idle() });
       }
       // pretend the user finishes the agent sign-ins in T3 Code
-      if (m.agents.some((a) => !a.signedIn)) setTimeout(() => patch(id, { agents: agents(true) }), 4000);
+      if (m.needsSignIn) setTimeout(() => patch(id, agents(true)), 4000);
     },
 
     async pair_machine({ id }) {

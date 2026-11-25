@@ -2,7 +2,7 @@
 //! both drive it.
 
 use crate::boat::{Boat, Starts};
-use crate::machine::{provision, Event, MachineRuntime, Power, Shared, WatchdogPhase};
+use crate::machine::{provision, signin, Event, MachineRuntime, Power, Shared, WatchdogPhase};
 use crate::proxy;
 use crate::store::{Doomed, Settings, Spend, State, Store};
 use crate::t3desktop::T3Desktop;
@@ -78,8 +78,12 @@ pub struct MachineView {
     /// Set while `detail` counts down, so the UI can tick it between updates.
     pub countdown: Option<Countdown>,
     pub paired: bool,
-    /// Its agents whose sign-in is known; one signed out needs it (done in T3 Code, per machine).
+    /// Its agents whose sign-in is known.
     pub agents: Vec<AgentLogin>,
+    /// No agent there is signed in: it needs one of those t3boat can sign in.
+    pub needs_sign_in: bool,
+    /// The browser sign-in t3boat runs there.
+    pub login: Option<crate::machine::login::LoginView>,
     /// Empty while unknown.
     pub t3_version: String,
     /// Its T3 projects as last seen, and those being added (with their progress).
@@ -661,6 +665,7 @@ impl App {
             // Held until retired: a later wake then sees Missing, and none restores meanwhile.
             let _waking = machine.waking.lock().await;
             machine.retire();
+            machine.cancel_login();
             // Read under the lock: a wake may have restored it onto a new sandbox.
             machine.record()
         };
@@ -709,6 +714,8 @@ impl App {
                 countdown: None,
                 paired: false,
                 agents: Vec::new(),
+                needs_sign_in: false,
+                login: None,
                 t3_version: String::new(),
                 projects: Vec::new(),
                 keep_awake_until: None,
@@ -851,8 +858,12 @@ pub struct MachineDetails {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLogin {
+    /// T3's provider instance id: what sign_in_agent takes.
+    pub instance_id: String,
     pub name: String,
     pub signed_in: bool,
+    /// t3boat can sign it in there.
+    pub can_sign_in: bool,
 }
 
 impl App {
@@ -885,6 +896,7 @@ impl App {
 
 fn view(m: &MachineRuntime) -> MachineView {
     let r = m.record();
+    let agents = m.cache.lock().unwrap().agents();
     let watchdog = m.watchdog_status();
     let mut countdown = None;
     let mut count_down = |template, secs, from| {
@@ -934,7 +946,18 @@ fn view(m: &MachineRuntime) -> MachineView {
         wake_error: m.wake_error().filter(|_| !m.is_waking() && m.power() != Power::Missing),
         countdown,
         paired: !r.client_tokens.is_empty(),
-        agents: m.cache.lock().unwrap().agents().into_iter().map(|(name, signed_in)| AgentLogin { name, signed_in }).collect(),
+        agents: agents
+            .iter()
+            .filter(|a| matches!(a.status.as_str(), "authenticated" | "unauthenticated"))
+            .map(|a| AgentLogin {
+                instance_id: a.instance_id.clone(),
+                name: a.name.clone(),
+                signed_in: a.status == "authenticated",
+                can_sign_in: signin::Agent::from_instance(&a.instance_id).is_some(),
+            })
+            .collect(),
+        needs_sign_in: signin::needs_sign_in(&agents),
+        login: m.login_view(),
         t3_version: r.t3_version.clone(),
         projects: m.projects(),
         keep_awake_until: running_watchdog

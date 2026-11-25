@@ -1,43 +1,30 @@
 //! T3 Connect: T3's own way for other devices (a phone, a browser) to reach a machine with the
 //! user's T3 account, through a tunnel the machine dials out. It is set up on the machine itself
-//! with T3's `t3 up --connect`, which t3boat runs there: its sign-in page opens here, and once it
-//! is on, t3boat turns on the one setting a sleeping machine needs.
+//! with T3's `t3 connect login` and `t3 up --connect`, which t3boat runs there: the sign-in page
+//! opens here, and once it is on, t3boat turns on the one setting a sleeping machine needs.
 
+use super::login::LoginStep;
 use super::MachineRuntime;
-use anyhow::{bail, Result};
+use crate::boat::Attached;
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Method;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// T3's device sign-in lasts 10 minutes; then the restart and the first tunnel connection.
-const SETUP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// What the user sees its sign-in as.
+const CONNECT: &str = "T3 Connect";
+/// For `t3 connect login` to reach its sign-in.
 const URL_TIMEOUT: Duration = Duration::from_secs(120);
+/// T3's device sign-in lasts 10 minutes, then `t3 connect login` fails by itself.
+const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(11 * 60);
+/// `t3 up`: the restart, and T3 checking the first tunnel connection for up to a minute.
+const UP_TIMEOUT_SECS: u64 = 5 * 60;
 
 impl MachineRuntime {
     /// Resolves once other devices can reach the machine through T3 Connect, after the user
     /// signed in to their T3 account in the browser.
     pub async fn turn_on_connect(&self) -> Result<()> {
-        self.ensure_awake("turning on T3 Connect").await?;
-        // `t3 up` restarts T3 to start the tunnel, which stops running agent turns and expires
-        // the approvals they wait on.
-        let s = self.watchdog_get("/status?fresh").await?;
-        if s.busy {
-            bail!("an agent is working; turn T3 Connect on once it finishes");
-        }
-        if s.waiting_threads > 0 {
-            bail!("an agent is waiting on you there; answer it, then turn T3 Connect on");
-        }
-        self.kept_awake(self.run_connect_setup()).await?;
-        // A webhook sent while the machine sleeps is then held by T3 Connect's relay and run as
-        // it wakes, instead of failing.
-        let state = self.connect_api(Method::GET, "link-state", None).await?;
-        let preferences = json!({
-            "publishAgentActivity": state["publishAgentActivity"].as_bool().unwrap_or(false),
-            "holdWebhooksWhileOffline": true,
-        });
-        self.connect_api(Method::POST, "preferences", Some(preferences)).await?;
-        self.update_record(|r| r.connect = true);
-        Ok(())
+        self.run_login(None, CONNECT, self.connect_setup()).await
     }
 
     /// Reads whether T3 Connect is on, for a machine that just woke: it can be turned on or off
@@ -54,52 +41,62 @@ impl MachineRuntime {
         }
     }
 
-    async fn run_connect_setup(&self) -> Result<()> {
-        let id = self.sandbox_id();
-        let boat = &self.shared.boat;
-        // In the background, so the sign-in page can be read while it waits; `exit` says how it ended.
-        let dir = boat
-            .exec_ok(
-                &id,
-                "d=$(mktemp -d); \
-                 (\"$HOME/.local/bin/t3\" up --connect --headless --yes > \"$d/log\" 2>&1; echo $? > \"$d/exit\") \
-                 </dev/null >/dev/null 2>&1 & echo \"$d\"",
-                30,
-            )
-            .await?;
-        let dir = dir.lines().last().unwrap_or_default().trim().to_owned();
-        let result = self.finish_connect_setup(&dir).await;
-        let _ = boat.exec(&id, &format!("rm -rf '{dir}'"), 30).await;
-        result
+    async fn connect_setup(&self) -> Result<()> {
+        // Signed in first, cancellable: `t3 up` then finds the sign-in and asks nothing, and is
+        // never stopped between saving the link and restarting T3 with it.
+        self.run_login_job(self.connect_login_script(), |job| self.follow_connect_login(job)).await?;
+        self.set_login_step(LoginStep::Finishing);
+        // A turn may have started while the user was in the browser; a retry then needs no
+        // browser, the sign-in is saved.
+        self.ensure_no_turn().await?;
+        let up = "\"$HOME/.local/bin/t3\" up --connect --headless --yes </dev/null 2>&1";
+        let up = self.shared.boat.exec(&self.sandbox_id(), up, UP_TIMEOUT_SECS).await?;
+        if up.exit_code != Some(0) {
+            let said = up.stdout.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no output");
+            bail!("T3 Connect setup failed: {said}");
+        }
+        // A webhook sent while the machine sleeps is then held by T3 Connect's relay and run as
+        // it wakes, instead of failing.
+        let state = self.connect_api(Method::GET, "link-state", None).await?;
+        let preferences = json!({
+            "publishAgentActivity": state["publishAgentActivity"].as_bool().unwrap_or(false),
+            "holdWebhooksWhileOffline": true,
+        });
+        self.connect_api(Method::POST, "preferences", Some(preferences)).await?;
+        self.update_record(|r| r.connect = true);
+        Ok(())
     }
 
-    async fn finish_connect_setup(&self, dir: &str) -> Result<()> {
-        let id = self.sandbox_id();
-        let boat = &self.shared.boat;
-        let started = Instant::now();
-        let mut opened = false;
-        loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let out = boat
-                .exec(&id, &format!("cat '{dir}/exit' 2>/dev/null; echo ---; cat '{dir}/log'"), 30)
-                .await?;
-            let (exit, log) = out.stdout.split_once("---").unwrap_or_default();
-            if !opened && let Some(url) = log.split_whitespace().find(|w| w.starts_with("https://")) {
-                crate::app::open_url(url)?;
-                opened = true;
-            }
-            match exit.trim() {
-                "" => {}
-                "0" => return Ok(()),
-                _ => bail!("T3 Connect setup failed: {}", last_line(log)),
-            }
-            if !opened && started.elapsed() > URL_TIMEOUT {
-                bail!("T3 Connect setup did not reach its sign-in: {}", last_line(log));
-            }
-            if started.elapsed() > SETUP_TIMEOUT {
-                bail!("the T3 Connect sign-in was not finished in the browser");
-            }
+    async fn connect_login_script(&self) -> Result<String> {
+        self.ensure_no_turn().await?;
+        Ok("\"$HOME/.local/bin/t3\" connect login --headless </dev/null 2>&1".to_owned())
+    }
+
+    /// `t3 up` restarts T3 to start the tunnel, which stops running agent turns and expires the
+    /// approvals they wait on.
+    async fn ensure_no_turn(&self) -> Result<()> {
+        let s = self.watchdog_get("/status?fresh").await?;
+        if s.busy {
+            bail!("an agent is working; turn T3 Connect on once it finishes");
         }
+        if s.waiting_threads > 0 {
+            bail!("an agent is waiting on you there; answer it, then turn T3 Connect on");
+        }
+        Ok(())
+    }
+
+    async fn follow_connect_login(&self, mut job: Attached) -> Result<()> {
+        // None when it needs no sign-in: still signed in from before.
+        let url = tokio::time::timeout(URL_TIMEOUT, job.next_url())
+            .await
+            .map_err(|_| anyhow!("T3 Connect did not reach its sign-in"))??;
+        if let Some(url) = url {
+            self.open_login_page(&url)?;
+        }
+        tokio::time::timeout(SIGN_IN_TIMEOUT, job.wait())
+            .await
+            .map_err(|_| anyhow!("the T3 Connect sign-in was not finished in the browser"))?
+            .context("the T3 Connect sign-in failed")
     }
 
     /// T3's `/api/connect/*` routes on the machine.
@@ -120,8 +117,4 @@ impl MachineRuntime {
         }
         Ok(res.json().await?)
     }
-}
-
-fn last_line(log: &str) -> &str {
-    log.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no output")
 }

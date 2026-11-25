@@ -5,6 +5,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdout};
 use crate::process::command;
 
 /// Boat's longest lifetime on a free trial, which refuses `--no-auto-stop`.
@@ -270,6 +272,40 @@ impl Boat {
         }
     }
 
+    /// Starts `script` in the background on the sandbox and returns its process id. It runs until
+    /// it ends, is killed, or the sandbox stops.
+    pub async fn exec_detached(&self, id: &str, script: &str) -> Result<u64> {
+        let out = self.run(&["exec", id, "--detach", "--", "bash", "-lc", script], Duration::from_secs(60)).await?;
+        let v = Self::last_json(&out)?;
+        v["processId"].as_u64().ok_or_else(|| anyhow!("boat exec --detach gave no process id: {v}"))
+    }
+
+    /// Follows a process `exec_detached` started, from its start until it ends.
+    pub fn attach(&self, id: &str, pid: u64) -> Result<Attached> {
+        let mut child = command(&self.bin)
+            .args(["--json", "exec", id, "--attach", &pid.to_string()])
+            .env("BOAT_NO_UPDATE", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("running boat exec --attach")?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("boat exec --attach has no output"))?;
+        Ok(Attached {
+            child,
+            frames: BufReader::new(stdout).lines(),
+            pending: String::new(),
+            last: String::new(),
+            stderr: String::new(),
+            exit: None,
+        })
+    }
+
+    /// Stops a process `exec_detached` started, and every process it started.
+    pub async fn kill(&self, id: &str, pid: u64) -> Result<()> {
+        self.run(&["exec", id, "--kill", &pid.to_string()], Duration::from_secs(60)).await.map(drop)
+    }
+
     /// Runs `script` and fails unless it exits 0. Returns stdout.
     pub async fn exec_ok(&self, id: &str, script: &str, timeout_secs: u64) -> Result<String> {
         let r = self.exec(id, script, timeout_secs).await?;
@@ -342,6 +378,85 @@ impl Boat {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         bail!("boat forward did not open port {port}")
+    }
+}
+
+/// A process on a sandbox, followed as it writes its output. Dropping it stops following, not
+/// the process.
+pub struct Attached {
+    child: Child,
+    /// One JSON frame per line: `stdout` / `stderr` chunks, then how it ended.
+    frames: Lines<BufReader<ChildStdout>>,
+    /// Stdout not yet split into lines: a chunk can end mid-line.
+    pending: String,
+    /// Its last non-empty line, and its stderr: what went wrong.
+    last: String,
+    stderr: String,
+    /// Its `exit` frame, once it ended. The CLI itself exits 0 however the process ended.
+    exit: Option<Value>,
+}
+
+impl Attached {
+    /// The process's next line of stdout; none once it ended.
+    pub async fn next_line(&mut self) -> Result<Option<String>> {
+        loop {
+            if let Some(i) = self.pending.find('\n') {
+                let line: String = self.pending.drain(..=i).collect();
+                return Ok(Some(self.seen(&line)));
+            }
+            let Some(frame) = self.frames.next_line().await? else {
+                if self.pending.is_empty() {
+                    return Ok(None);
+                }
+                let line = std::mem::take(&mut self.pending);
+                return Ok(Some(self.seen(&line)));
+            };
+            let frame: Value = serde_json::from_str(&frame).unwrap_or_default();
+            if frame["type"] == "stdout" {
+                self.pending.push_str(frame["data"].as_str().unwrap_or_default());
+            } else if frame["type"] == "stderr" {
+                self.stderr.push_str(frame["data"].as_str().unwrap_or_default());
+            } else if frame["type"] == "exit" {
+                self.exit = Some(frame);
+            } else if frame["event"] == "error" || frame["type"] == "error" {
+                let error = frame["message"].as_str().or(frame["error"].as_str()).unwrap_or("unknown error");
+                bail!("boat exec --attach failed: {error}");
+            }
+        }
+    }
+
+    fn seen(&mut self, line: &str) -> String {
+        if !line.trim().is_empty() {
+            self.last = line.trim().to_owned();
+        }
+        line.trim_end().to_owned()
+    }
+
+    /// The next `https://` address in its output; none once it ended without one.
+    pub async fn next_url(&mut self) -> Result<Option<String>> {
+        while let Some(line) = self.next_line().await? {
+            if let Some(url) = line.split_whitespace().find(|w| w.starts_with("https://")) {
+                return Ok(Some(url.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Waits for it to end; fails unless it exited 0, with its last line of stderr, else of stdout.
+    pub async fn wait(mut self) -> Result<()> {
+        while self.next_line().await?.is_some() {}
+        let Some(exit) = self.exit else {
+            let out = self.child.wait_with_output().await?;
+            bail!("boat exec --attach ended before the process: {}", String::from_utf8_lossy(&out.stderr).trim());
+        };
+        if exit["exitCode"] == 0 {
+            return Ok(());
+        }
+        let stderr = self.stderr.lines().rev().map(str::trim).find(|l| !l.is_empty());
+        match stderr.unwrap_or(&self.last) {
+            "" => bail!("it failed with no output"),
+            said => bail!("{said}"),
+        }
     }
 }
 
@@ -432,12 +547,31 @@ case " $* " in
 esac
 "#;
 
-    fn fake_boat(name: &str, flag: Option<&str>) -> (Boat, std::path::PathBuf) {
+    /// Starts one process and follows it: a sign-in page, then an exit with the code in `$d/code`
+    /// and, unless that is 0, what went wrong in `$d/error` (stderr). Like Boat's, the CLI exits 0
+    /// however the process ended.
+    const JOB_BOAT: &str = r#"#!/bin/sh
+d=$(dirname "$0"); shift
+echo "$*" >> "$d/log"
+frame() { printf '%s\n' "$1"; }
+case " $* " in
+  *" --detach "*) frame '{"ok":true,"type":"command.started","processId":42,"pid":42}' ;;
+  *" --attach 42 "*)
+    frame '{"type":"attached","processId":42,"stdoutOffset":0,"stderrOffset":0}'
+    frame '{"type":"stdout","data":"Open on any device:\n  https://t3.example/device?code=AB"}'
+    frame '{"type":"stdout","data":"CD\nWaiting"}'
+    [ -f "$d/error" ] && frame "{\"type\":\"stderr\",\"data\":\"$(cat "$d/error")\\n\"}"
+    frame "{\"exitCode\":$(cat "$d/code"),\"signal\":null,\"status\":\"exited\",\"type\":\"exit\"}" ;;
+  *) exit 1 ;;
+esac
+"#;
+
+    fn fake_boat(name: &str, script: &str, flag: Option<&str>) -> (Boat, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("t3boat-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("boat");
-        std::fs::write(&bin, TRIAL_BOAT).unwrap();
+        std::fs::write(&bin, script).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         if let Some(flag) = flag {
             std::fs::write(dir.join(flag), "").unwrap();
@@ -451,7 +585,7 @@ esac
 
     #[tokio::test]
     async fn trial_accounts_get_the_longest_ttl_instead_of_no_auto_stop() {
-        let (boat, dir) = fake_boat("trial", Some("trial"));
+        let (boat, dir) = fake_boat("trial", TRIAL_BOAT, Some("trial"));
         assert_eq!(boat.create("m", "default", None).await.unwrap(), "bx_new");
         assert_eq!(boat.resume("bx_new", "small").await.unwrap(), Resume::Resumed);
         assert_eq!(
@@ -468,15 +602,42 @@ esac
 
     #[tokio::test]
     async fn paid_accounts_and_other_failures_never_fall_back_to_a_ttl() {
-        let (paid, dir) = fake_boat("paid", None);
+        let (paid, dir) = fake_boat("paid", TRIAL_BOAT, None);
         assert_eq!(paid.create("m", "large", None).await.unwrap(), "bx_new");
         assert_eq!(calls(&dir), ["new --name m --type large --no-auto-stop"]);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let (down, dir) = fake_boat("down", Some("down"));
+        let (down, dir) = fake_boat("down", TRIAL_BOAT, Some("down"));
         let err = down.create("m", "default", None).await.unwrap_err().to_string();
         assert!(err.contains("Boat is down"), "{err}");
         assert_eq!(calls(&dir), ["new --name m --type default --no-auto-stop"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_detached_job_is_followed_line_by_line_until_it_ends() {
+        let (boat, dir) = fake_boat("job", JOB_BOAT, None);
+        std::fs::write(dir.join("code"), "0").unwrap();
+        let pid = boat.exec_detached("bx_1", "t3 up").await.unwrap();
+        assert_eq!(pid, 42);
+        let mut job = boat.attach("bx_1", pid).unwrap();
+        // The address spans two chunks.
+        assert_eq!(job.next_url().await.unwrap().as_deref(), Some("https://t3.example/device?code=ABCD"));
+        job.wait().await.unwrap();
+        assert_eq!(calls(&dir), ["exec bx_1 --detach -- bash -lc t3 up", "exec bx_1 --attach 42"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_detached_job_fails_by_its_own_exit_code_with_what_it_said() {
+        let (boat, dir) = fake_boat("job-fails", JOB_BOAT, None);
+        std::fs::write(dir.join("code"), "1").unwrap();
+        let err = boat.attach("bx_1", 42).unwrap().wait().await.unwrap_err().to_string();
+        assert_eq!(err, "Waiting");
+        // Its stderr says it better than its stdout.
+        std::fs::write(dir.join("error"), "Sign-in expired").unwrap();
+        let err = boat.attach("bx_1", 42).unwrap().wait().await.unwrap_err().to_string();
+        assert_eq!(err, "Sign-in expired");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

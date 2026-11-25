@@ -269,6 +269,14 @@ button.row-name {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.line-status-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.line-status .btn {
+  flex-shrink: 0;
+}
 
 /* power */
 .toggle {

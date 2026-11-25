@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useMachineDetails, useLatestThread } from "../api";
-import type { MachineDetails as Details, LocalProject, MachineView, Size } from "../types";
+import type { MachineDetails as Details, LocalProject, MachineLogin, MachineView, Size } from "../types";
 import {
   ACTIONS,
   autoSleep,
@@ -8,6 +8,8 @@ import {
   hourly,
   STAY_AWAKE,
   keepAwake,
+  canCancelLogin,
+  loginStep,
   machineKey,
   money,
   powerAction,
@@ -20,7 +22,9 @@ import {
   signInTo,
   sizeOf,
   timeLeft,
+  TURN_ON_CONNECT,
   type Action,
+  type LoginAction,
 } from "../machine";
 import { AgentName } from "./AgentLogos";
 import { BoatIcon } from "./BoatIcon";
@@ -39,6 +43,8 @@ interface Props {
   /** opened from the row's "Add a project…" or "Add one": start with the project picker open */
   pickProject: boolean;
   onAction: (a: Action) => void;
+  onLogin: (l: LoginAction) => void;
+  onCancelLogin: () => void;
   onAddProject: (p: LocalProject) => void;
   onDismissDeleteError: () => void;
   onError: (text: string) => void;
@@ -53,6 +59,8 @@ export function MachineDetails({
   deleteError,
   pickProject,
   onAction,
+  onLogin,
+  onCancelLogin,
   onAddProject,
   onDismissDeleteError,
   onError,
@@ -74,8 +82,8 @@ export function MachineDetails({
       <div className="view-body details-body">
         <Glance m={m} size={sizeOf(sizes, m.size)} d={d} />
         {gone ? null : <Power m={m} busy={busy} onAction={onAction} />}
-        {m.agents.length > 0 && <Agents m={m} pending={pending} onAction={onAction} />}
-        <Connect m={m} pending={pending} onAction={onAction} />
+        <Agents m={m} busy={busy} onLogin={onLogin} onCancelLogin={onCancelLogin} />
+        <Connect m={m} busy={busy} onLogin={onLogin} onCancelLogin={onCancelLogin} />
         <Projects m={m} pickProject={pickProject} onAddProject={onAddProject} />
         <MachineMore
           m={m}
@@ -290,52 +298,70 @@ function StayAwake({ m, busy, onAction }: { m: MachineView; busy: boolean; onAct
   );
 }
 
-function Agents({ m, pending, onAction }: { m: MachineView; pending: string | null; onAction: (a: Action) => void }) {
-  const [signingIn, setSigningIn] = useState<string | null>(null);
+interface LoginProps {
+  m: MachineView;
+  /** a tracked action runs for this machine */
+  busy: boolean;
+  onLogin: (l: LoginAction) => void;
+  onCancelLogin: () => void;
+}
+
+/** Where a sign-in is, with a way out: it can wait on a browser tab that was left. */
+function LoginRunning({ login, onCancel }: { login: MachineLogin; onCancel: () => void }) {
+  return (
+    <span className="line-status caption">
+      <Dots /> <span className="line-status-text">{loginStep(login)}</span>
+      {canCancelLogin(login) ? (
+        <button className="btn btn-link" onClick={onCancel}>
+          Cancel
+        </button>
+      ) : null}
+    </span>
+  );
+}
+
+function Agents({ m, busy, onLogin, onCancelLogin }: LoginProps) {
+  const login = m.login;
+  // A running sign-in keeps its row even when the list was cleared meanwhile (T3 upgraded during the wake).
+  const agents =
+    login?.instanceId != null && !m.agents.some((a) => a.instanceId === login.instanceId)
+      ? [...m.agents, { instanceId: login.instanceId, name: login.name, signedIn: false, canSignIn: false }]
+      : m.agents;
+  if (!agents.length) return null;
   return (
     <Section title="agents">
       <ul className="lines">
-        {m.agents.map((a) => {
-          const running = signingIn === a.name && pending === signInTo(a.name).busy;
-          return (
-            <li key={a.name} className="line">
-              <span className="line-main">
-                <AgentName name={a.name} />
+        {agents.map((a) => (
+          <li key={a.instanceId} className="line">
+            <span className="line-main">
+              <AgentName name={a.name} />
+            </span>
+            {login?.instanceId === a.instanceId ? (
+              <LoginRunning login={login} onCancel={onCancelLogin} />
+            ) : a.signedIn ? (
+              <span className="line-ok">
+                <Icon name="check" size={10} /> signed in
               </span>
-              {a.signedIn ? (
-                <span className="line-ok">
-                  <Icon name="check" size={10} /> signed in
-                </span>
-              ) : (
-                <button
-                  className="btn btn-sm btn-outline"
-                  disabled={!!pending || m.state === "missing"}
-                  aria-busy={running}
-                  onClick={() => {
-                    setSigningIn(a.name);
-                    onAction(signInTo(a.name));
-                  }}
-                >
-                  {running ? (
-                    <>
-                      <Dots /> Signing in…
-                    </>
-                  ) : (
-                    "Sign in"
-                  )}
-                </button>
-              )}
-            </li>
-          );
-        })}
+            ) : a.canSignIn ? (
+              <button
+                className="btn btn-sm btn-outline"
+                disabled={busy || !!login || m.state === "missing"}
+                onClick={() => onLogin(signInTo(a))}
+              >
+                Sign in
+              </button>
+            ) : (
+              <span className="caption">signed out</span>
+            )}
+          </li>
+        ))}
       </ul>
     </Section>
   );
 }
 
 /** T3 Connect: the user's phone or a browser reach the machine with their T3 account. */
-function Connect({ m, pending, onAction }: { m: MachineView; pending: string | null; onAction: (a: Action) => void }) {
-  const running = pending === ACTIONS.connect.busy;
+function Connect({ m, busy, onLogin, onCancelLogin }: LoginProps) {
   return (
     <Section title="other devices">
       <ul className="lines">
@@ -345,20 +371,15 @@ function Connect({ m, pending, onAction }: { m: MachineView; pending: string | n
             <span className="line-ok">
               <Icon name="check" size={10} /> on
             </span>
+          ) : m.login && m.login.instanceId === null ? (
+            <LoginRunning login={m.login} onCancel={onCancelLogin} />
           ) : (
             <button
               className="btn btn-sm btn-outline"
-              disabled={!!pending || m.state === "missing"}
-              aria-busy={running}
-              onClick={() => onAction(ACTIONS.connect)}
+              disabled={busy || !!m.login || m.state === "missing"}
+              onClick={() => onLogin(TURN_ON_CONNECT)}
             >
-              {running ? (
-                <>
-                  <Dots /> {ACTIONS.connect.busy}
-                </>
-              ) : (
-                ACTIONS.connect.label
-              )}
+              Turn on
             </button>
           )}
         </li>
