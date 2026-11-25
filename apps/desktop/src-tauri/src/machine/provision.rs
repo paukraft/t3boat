@@ -111,6 +111,20 @@ pub async fn run(
     Ok(serde_json::from_str(line)?)
 }
 
+/// Downloads and unpacks T3 `t3_version` on a running machine without switching to it, so the
+/// wake that moves the machine there only switches and restarts T3: T3's installer keeps each
+/// version apart and skips one already there. Its launcher goes to a folder of t3boat's own, as
+/// T3 removes a version no launcher points at when it starts. One per wake: a machine kept awake
+/// across releases would pile them up, as T3 prunes only as it starts; the wake removes the
+/// launcher and installs the version it wants.
+pub async fn stage(boat: &Boat, sandbox_id: &str, t3_version: &str) -> Result<()> {
+    let script = format!(
+        "set -o pipefail; [ -e \"$HOME/.t3boat/staged/t3\" ] || curl -fsSL https://t3.codes/install.sh | T3CODE_VERSION={v} T3CODE_INSTALL_BIN_DIR=\"$HOME/.t3boat/staged\" sh",
+        v = shell_word(t3_version)?,
+    );
+    boat.exec_ok(sandbox_id, &script, 600).await.map(drop)
+}
+
 /// Only `[A-Za-z0-9._-]` reaches the remote shell.
 fn shell_word(s: &str) -> Result<&str> {
     if !s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
