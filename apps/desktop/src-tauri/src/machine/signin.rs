@@ -13,9 +13,9 @@ use std::time::Duration;
 
 /// For the CLI to start its login and hand over the page.
 const URL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Authorizing is a click, or a sign-in with a second factor. A tab left open keeps the machine
-/// awake, and billing, no longer than this.
-const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Authorizing is a click, or a sign-in with a second factor, maybe after finding the tab later.
+/// Cancel ends it sooner.
+const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// On the machine: the page's address passes through a pipe here, and the CLI's output to a log.
 const LOGIN_DIR: &str = "/tmp/t3boat-login";
 
