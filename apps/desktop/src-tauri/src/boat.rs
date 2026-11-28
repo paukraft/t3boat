@@ -353,31 +353,54 @@ impl Boat {
     }
 
     /// Forwards `port` on this computer to the same port in the sandbox, for as long as the
-    /// returned process lives.
-    pub async fn forward(&self, id: &str, port: u16) -> Result<tokio::process::Child> {
+    /// returned `Forward` lives.
+    pub async fn forward(&self, id: &str, port: u16) -> Result<Forward> {
         // Else another listener on the port would pass the readiness check below.
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
             bail!("port {port} is in use on this computer; finish or close the other sign-in first");
         }
         let p = port.to_string();
-        let mut child = command(&self.bin)
-            .args(["forward", id, "--remote", &p, "--local", &p])
+        let mut cmd = command(&self.bin);
+        cmd.args(["forward", id, "--remote", &p, "--local", &p])
             .env("BOAT_NO_UPDATE", "1")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .context("running boat forward")?;
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut forward = Forward(cmd.spawn().context("running boat forward")?);
         for _ in 0..100 {
-            if let Some(status) = child.try_wait()? {
+            if let Some(status) = forward.0.try_wait()? {
                 bail!("boat forward exited ({status}); is port {port} free on this computer?");
             }
             if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                return Ok(child);
+                return Ok(forward);
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         bail!("boat forward did not open port {port}")
+    }
+}
+
+/// A running `boat forward`; dropping it closes the port.
+pub struct Forward(tokio::process::Child);
+
+impl Drop for Forward {
+    /// Stopping the CLI alone leaves the ssh it runs holding the port, so this stops both.
+    fn drop(&mut self) {
+        let Some(pid) = self.0.id() else { return };
+        // SAFETY: a plain signal to the CLI's own process group, made at spawn.
+        #[cfg(unix)]
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .status();
+        }
     }
 }
 
@@ -566,6 +589,12 @@ case " $* " in
 esac
 "#;
 
+    /// Like Boat's, holds the port from a child of its own, which outlives the CLI.
+    const FORWARD_BOAT: &str = r#"#!/bin/sh
+perl -MIO::Socket::INET -e 'my $s = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => $ARGV[0], Listen => 1, ReuseAddr => 1) or die; sleep 60' "$6" &
+wait
+"#;
+
     fn fake_boat(name: &str, script: &str, flag: Option<&str>) -> (Boat, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("t3boat-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -638,6 +667,22 @@ esac
         std::fs::write(dir.join("error"), "Sign-in expired").unwrap();
         let err = boat.attach("bx_1", 42).unwrap().wait().await.unwrap_err().to_string();
         assert_eq!(err, "Sign-in expired");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_forward_frees_its_port() {
+        let (boat, dir) = fake_boat("forward", FORWARD_BOAT, None);
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        drop(boat.forward("bx_1", port).await.unwrap());
+        let free = || std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
+        for _ in 0..50 {
+            if free() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(free(), "port {port} still held");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
