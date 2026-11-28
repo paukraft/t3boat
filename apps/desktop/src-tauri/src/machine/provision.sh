@@ -93,7 +93,10 @@ fi
 
 ready=0
 for _ in $(seq 1 120); do
-  if curl -sf -o /dev/null http://127.0.0.1:3773/.well-known/t3/environment; then ready=1; break; fi
+  if environment="$(curl -sf --max-time 2 http://127.0.0.1:3773/.well-known/t3/environment)"; then
+    ready=1
+    break
+  fi
   sleep 0.5
 done
 if [ "$ready" != 1 ]; then
@@ -139,7 +142,7 @@ upstream_token=""
 if [ "$mint_upstream" = 1 ]; then
   upstream_token="$("$t3" auth session issue --token-only --ttl 3650d --label t3boat)"
 fi
-environment_id="$(curl -sf http://127.0.0.1:3773/.well-known/t3/environment | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).environmentId))')"
+environment_id="$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).environmentId))' <<< "$environment")"
 ENV_ID="$environment_id" TOK="$upstream_token" node -e '
   const o = { environmentId: process.env.ENV_ID };
   if (process.env.TOK) o.upstreamToken = process.env.TOK;
