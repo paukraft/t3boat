@@ -35,7 +35,7 @@ const UPGRADE_RETRY: Duration = Duration::from_secs(10 * 60);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(20);
 /// Preview tunnel traffic counts as use only this long after a person's last other action: a
 /// page left open (hot reload, polling) would otherwise keep the machine up all night.
-const TUNNEL_ATTENDED: Duration = Duration::from_secs(30 * 60);
+const TUNNEL_ATTENDED: Duration = Duration::from_secs(2 * 60 * 60);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// A requested sleep: the 45 s grace for the ack, a save called off earlier still running (up
@@ -648,7 +648,7 @@ impl MachineRuntime {
 
     /// Input through the preview tunnel: use while the person is around, never on its own.
     pub fn tunnel_input(self: &Arc<Self>) {
-        if attended(*self.last_user_action.lock().unwrap()) {
+        if attended(self.last_user_action.lock().unwrap().map(|t| t.elapsed())) {
             self.used();
         }
     }
@@ -656,7 +656,7 @@ impl MachineRuntime {
     /// What the preview tunnel sends the page (server-sent events, hot reload): keeps the machine
     /// awake while the person is around, but changes nothing its recorded answers hold.
     pub fn tunnel_output(self: &Arc<Self>) {
-        if attended(*self.last_user_action.lock().unwrap()) {
+        if attended(self.last_user_action.lock().unwrap().map(|t| t.elapsed())) {
             self.stay_awake();
         }
     }
@@ -1136,8 +1136,9 @@ impl MachineRuntime {
     }
 }
 
-fn attended(last_user_action: Option<Instant>) -> bool {
-    last_user_action.is_some_and(|t| t.elapsed() < TUNNEL_ATTENDED)
+/// `since`: time since the person's last other action, if any.
+fn attended(since: Option<Duration>) -> bool {
+    since.is_some_and(|d| d < TUNNEL_ATTENDED)
 }
 
 #[cfg(test)]
@@ -1146,9 +1147,9 @@ mod tests {
 
     #[test]
     fn tunnel_traffic_counts_only_while_someone_is_around() {
-        let ago = |minutes: u64| Instant::now().checked_sub(Duration::from_secs(minutes * 60));
+        let minutes = |m: u64| Some(Duration::from_secs(m * 60));
         assert!(!attended(None));
-        assert!(attended(ago(29)));
-        assert!(!attended(ago(31)));
+        assert!(attended(minutes(119)));
+        assert!(!attended(minutes(121)));
     }
 }
