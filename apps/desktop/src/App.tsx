@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { call, errorText, useUiState } from "./api";
 import type { LocalProject, McpClient, MachineView, SetupAction, UiState } from "./types";
-import { machineKey, type Action } from "./machine";
+import { machineKey, type Action, type LoginAction } from "./machine";
 import { Ocean, type OceanBoat } from "./components/Ocean";
 import { MachineRow } from "./components/MachineRow";
 import { NewMachine } from "./components/NewMachine";
@@ -132,6 +132,19 @@ function Ready({ state, toast }: { state: UiState; toast: (t: string, tone?: "er
       (e) => toast(`Couldn't add ${p.title} to ${m.name}: ${errorText(e)}`),
     );
 
+  // Not tracked actions either: the browser part can take minutes, and the machine shows it, with Cancel.
+  const login = (m: MachineView, l: LoginAction) => {
+    const [running, done] =
+      l.cmd === "sign_in_agent"
+        ? [call("sign_in_agent", { id: m.id, instanceId: l.agent.instanceId }), `${l.agent.name} is signed in on ${m.name}`]
+        : [call("turn_on_connect", { id: m.id }), `${m.name} is reachable from your other devices`];
+    running.then(
+      (finished) => finished && toast(done, "info"),
+      (e) => toast(`${m.name}: ${errorText(e)}`),
+    );
+  };
+  const cancelLogin = (m: MachineView) => call("cancel_login", { id: m.id }).catch((e) => toast(`${m.name}: ${errorText(e)}`));
+
   const pick = (key: string) => {
     const m = state.machines.find((x) => machineKey(x) === key);
     if (m && canOpen(m)) openDetails(m);
@@ -159,14 +172,6 @@ function Ready({ state, toast }: { state: UiState; toast: (t: string, tone?: "er
             if (a.discard) throw e;
             setDeleteErrors((d) => ({ ...d, [key]: errorText(e) }));
           }
-          return;
-        case "sign_in_agent":
-          await call("sign_in_agent", { id: m.id, agent: a.agent });
-          toast(`${a.agent} is signed in on ${m.name}`, "info");
-          return;
-        case "turn_on_connect":
-          await call("turn_on_connect", { id: m.id });
-          toast(`${m.name} is reachable from your other devices`, "info");
           return;
         case "keep_awake":
           await call("keep_awake", { id: m.id, minutes: a.minutes });
@@ -215,6 +220,8 @@ function Ready({ state, toast }: { state: UiState; toast: (t: string, tone?: "er
           deleteError={deleteErrors[machineKey(selected)] ?? null}
           pickProject={pickProject}
           onAction={(a) => act(selected, a)}
+          onLogin={(l) => login(selected, l)}
+          onCancelLogin={() => cancelLogin(selected)}
           onAddProject={(p) => addProject(selected, p)}
           onDismissDeleteError={() => setDeleteErrors((d) => without(d, machineKey(selected)))}
           onError={detailsError}
@@ -267,6 +274,8 @@ function Ready({ state, toast }: { state: UiState; toast: (t: string, tone?: "er
                     pending={pending[machineKey(m)] ?? null}
                     deleteError={deleteErrors[machineKey(m)] ?? null}
                     onAction={(a) => act(m, a)}
+                    onLogin={(l) => login(m, l)}
+                    onCancelLogin={() => cancelLogin(m)}
                     onDismissDeleteError={() => setDeleteErrors((d) => without(d, machineKey(m)))}
                     onHover={setHover}
                     onOpen={canOpen(m) ? (pick) => openDetails(m, pick) : undefined}

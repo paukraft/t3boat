@@ -3,6 +3,7 @@
 //! (they could run the Boat CLI anyway); Host and Origin checks keep web pages out.
 
 use crate::app::App;
+use crate::machine::login::Cancelled;
 use crate::machine::signin::Agent;
 use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::State;
@@ -179,9 +180,10 @@ fn tool_list() -> Value {
         tool(
             "list_machines",
             "Lists the user's t3boat machines with id, size, state (working | idle | asleep | waking | \
-             sleeping | creating | missing | unknown (still checking)) and a detail line, why its last wake failed (wakeError), its agents and whether each is signed \
-             in there (agents), its T3 version (t3Version), its T3 projects (with progress while one is being added), whether T3 \
-             Connect is on (connect), plus Boat costs today and this month and machine starts used \
+             sleeping | creating | missing | unknown (still checking)) and a detail line, why its last wake failed (wakeError), its agents \
+             by instanceId and whether each is signed in there (agents), whether it needs a sign-in, as no agent there is \
+             (needsSignIn), a sign-in running there (login), its T3 version (t3Version), its T3 projects (with progress while one \
+             is being added), whether T3 Connect is on (connect), plus Boat costs today and this month and machine starts used \
              today against the daily limit.",
             json!({}),
             &[],
@@ -257,7 +259,11 @@ fn tool_list() -> Value {
              The credential is created on the machine; this computer's logins are not touched.",
             json!({
                 "machine": machine,
-                "agent": { "type": "string", "enum": ["Claude", "Codex"] },
+                "agent": {
+                    "type": "string",
+                    "enum": ["claudeAgent", "codex"],
+                    "description": "The agent's instanceId, as list_machines' agents give it",
+                },
             }),
             &["machine", "agent"],
         ),
@@ -339,7 +345,10 @@ impl Tools for App {
         let (tx, rx) = tokio::sync::oneshot::channel();
         // Detached, so a client that gives up does not cancel the work halfway.
         tokio::spawn(async move {
-            if let Err(Err(e)) = tx.send(run(&self, call).await) {
+            // A sign-in the user cancelled needs no telling.
+            if let Err(Err(e)) = tx.send(run(&self, call).await)
+                && !e.is::<Cancelled>()
+            {
                 tracing::warn!("tool call the client stopped waiting for: {e:#}");
                 self.shared.notify(NAME, crate::boat::plain(&e));
             }
@@ -393,10 +402,12 @@ async fn run(app: &Arc<App>, call: Call) -> Result<String> {
             format!("{} is set to {size}; it applies when it next wakes (right away if it was idle and no agent waited on the user).", m.record().name)
         }
         Call::SignInAgent { machine, agent } => {
-            let a = Agent::from_name(&agent).ok_or_else(|| anyhow!("agent must be Claude or Codex"))?;
+            let Some(agent) = Agent::from_instance(&agent) else {
+                bail!("agent must be claudeAgent or codex");
+            };
             let m = app.machine(&machine)?;
-            m.sign_in(a).await?;
-            format!("{agent} is signed in on {}.", m.record().name)
+            m.sign_in(agent).await?;
+            format!("{} is signed in on {}.", agent.name(), m.record().name)
         }
         Call::TurnOnConnect { machine } => {
             let m = app.machine(&machine)?;

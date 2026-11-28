@@ -32,10 +32,22 @@ interface MachineView {
                        // set while detail counts down: template ("Idle · sleeps in {left}") with
                        // {left} = time until endsAt (unix ms); the UI ticks it between state events
   paired: boolean;     // false: T3 Code has not accepted it yet → show "Add to T3 Code"
-  agents: { name: string; signedIn: boolean }[];
-                       // its agents whose sign-in is known, e.g. Claude, Codex. Each signed out one
-                       // gets a button → sign_in_agent: the vendor's own login runs on the
-                       // machine, the browser opens, the user authorizes, done.
+  agents: { instanceId: string; name: string; signedIn: boolean; canSignIn: boolean }[];
+                       // its agents whose sign-in is known. instanceId: T3's provider instance id,
+                       // what sign_in_agent takes; name: T3's display name, the user's to edit: only
+                       // for showing; canSignIn: t3boat can sign it in, i.e. T3's default Claude and
+                       // Codex instances (instanceId "claudeAgent", "codex") → Sign in, else "signed out".
+                       // Sign in → sign_in_agent: the vendor's own login runs on the machine, the
+                       // browser opens, the user authorizes, done.
+  needsSignIn: boolean; // no agent there is signed in (one T3 can't tell counts as maybe signed in), and
+                       // t3boat can sign one in: the row offers those with canSignIn
+  login: { instanceId: string | null; name: string; step: "waking" | "starting" | "browser" | "finishing" } | null;
+                       // a sign-in t3boat runs there (sign_in_agent, turn_on_connect): instanceId =
+                       // the agent's (match rows by it), null for T3 Connect; name = the agent's
+                       // display name or "T3 Connect", only for showing; step: "Waking…", "Opening sign-in…", then
+                       // "Approve in browser…" once its page is open, then "Finishing…" once
+                       // signed in. Shown with Cancel → cancel_login, except while finishing.
+                       // One at a time per machine; it does not lock the machine's other controls
   t3Version: string;   // T3 server version on the machine, e.g. "0.0.21"; "" while unknown
   projects: { title: string; repoKey: string | null; status: string | null }[];
                        // its T3 projects as last seen (never wakes it), then those t3boat is adding:
@@ -91,8 +103,9 @@ interface MachineDetails {
 | `sleep_machine` | `{ id }` | rejects with "an agent is working" mid-turn; a run waiting only on the user does sleep, an approval it waits on expires if the resume is cold |
 | `open_machine` | `{ id, thread? }` | brings T3 Code forward, into `thread` (an id from `latest_thread`) if given; re-sends the "add to T3 Code" dialog if not paired |
 | `pair_machine` | `{ id }` | re-sends T3 Code's "add backend" dialog (secondary "Add to T3 Code again") |
-| `sign_in_agent` | `{ id, agent }` | agent = a signed out `agents` name ("Claude", "Codex"); resolves once signed in (user finishes in the browser, up to 10 min) |
-| `turn_on_connect` | `{ id }` | turns on T3 Connect with T3's own `t3 up --connect` on the machine: T3's sign-in page opens in the browser, the user approves it, T3 restarts there; resolves once other devices can reach it (up to ~15 min). Rejects while an agent works or waits on the user there (the restart would stop it, or expire the approval it waits on). Details shows "other devices · T3 Connect" with Turn on, or "on" |
+| `sign_in_agent` | `{ id, instanceId }` | instanceId = an `agents` one's with `canSignIn`; resolves `true` once signed in (user finishes in the browser, up to 10 min), `false` when cancelled. Not a tracked action: the machine's `login` shows it |
+| `turn_on_connect` | `{ id }` | turns on T3 Connect with T3's own `t3 connect login`, then `t3 up --connect`, on the machine: T3's sign-in page opens in the browser, the user approves it, T3 restarts there (no longer cancellable); resolves `true` once other devices can reach it (up to ~15 min), `false` when cancelled; not a tracked action, the machine's `login` shows it. Rejects while an agent works or waits on the user there, before the sign-in and again before the restart (the restart would stop it, or expire the approval it waits on). Details shows "other devices · T3 Connect" with Turn on, or "on" |
+| `cancel_login` | `{ id }` | ends the sign-in running there (`login`): stops it on the machine, and its keeping the machine awake |
 | `keep_awake` | `{ id, minutes }` | keeps the machine up that long even unused (`null`: until stopped, i.e. no auto sleep; 0 ends it; "Sleep now" ends it too); wakes it if asleep; enforced on the machine, so it holds with the laptop closed. Details has an **Auto sleep** switch (on = `!keepAwakeForever`; off → `null`, on → `0`) and, while auto sleep is on, a one-time "Stay awake for…" (15m · 30m · 1h · 2h) that runs out by itself, with Stop (`0`) while `keepAwakeUntil` is set |
 | `resize_machine` | `{ id, size }` | asleep: applies on next wake; idle: sleeps and wakes onto it now, keeping a "keep awake"; working (an agent or a build), or an agent there waits on the user: applies after it next sleeps, never mid-turn |
 | `delete_machine` | `{ id, discard? }` | permanent; UI must confirm first. Rejects while an agent or build works on it, or while its state can't be told yet (e.g. mid-wake); then offer "Delete anyway" = `discard: true`. An agent there waiting on the user doesn't stop it. T3 Code cannot be told to forget a backend, so deleting a paired machine brings T3 Code to the front with a notification naming the entry to remove under Settings → Environments. Its local port is never given to another machine, so that entry can't reach one. Resolves once the machine is gone here; its sandbox and snapshot are deleted on Boat in the background until Boat confirms (retried, also across launches) |

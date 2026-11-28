@@ -5,6 +5,7 @@ mod capture;
 mod connect;
 mod disk;
 mod link;
+pub mod login;
 pub mod projects;
 pub mod provision;
 pub mod signin;
@@ -207,6 +208,8 @@ pub struct MachineRuntime {
     /// Its T3 projects as last read, and those t3boat is adding.
     projects: Mutex<Vec<projects::MachineProject>>,
     adding: Mutex<Vec<projects::MachineProject>>,
+    /// The browser sign-in t3boat runs there.
+    login: Mutex<Option<login::Login>>,
 }
 
 impl MachineRuntime {
@@ -234,6 +237,7 @@ impl MachineRuntime {
             save_failure: Mutex::new(None),
             projects: Mutex::new(Vec::new()),
             adding: Mutex::new(Vec::new()),
+            login: Mutex::new(None),
         };
         if let Some(shell) = shell {
             this.set_projects_from(&shell);
