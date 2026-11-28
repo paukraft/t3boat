@@ -59,8 +59,15 @@ let phase = "active";
 let lastActivityAt = Date.now();
 /** Last time an agent, the user or a keep-awake held it up: CPU load holds it only so long after. */
 let lastUsedAt = Date.now();
-/** Agent runs in flight (top-level threads and subagents), and runs waiting on a person. */
-let working = { threads: 0, subagents: 0, waiting: 0 };
+/**
+ * Agent runs in flight (top-level threads and subagents), runs waiting on a person, and unsettled
+ * top-level threads whose turn ended within AWAITING_REPLY_MS.
+ */
+let working = { threads: 0, subagents: 0, waiting: 0, awaitingReply: 0 };
+// A turn can end on a question asked in its reply, which T3 cannot tell from a finished task, so
+// an unsettled thread holds the machine this long; settling it lets the machine sleep.
+const AWAITING_REPLY_MS = 30 * 60_000;
+const awaitingReply = () => !sleepRequested && working.awaitingReply > 0;
 // T3 not answering: an agent might be mid-turn, so count it as working, but only this long, so a
 // broken server cannot keep the machine billing.
 const UNKNOWN_BUSY_MS = 30 * 60_000;
@@ -82,7 +89,7 @@ async function refreshWorking() {
     unknownSince = 0;
     t3Answered = true;
   } catch (e) {
-    working = { threads: 0, subagents: 0, waiting: 0 };
+    working = { threads: 0, subagents: 0, waiting: 0, awaitingReply: 0 };
     if (t3Answered) unknownSince ||= Date.now();
     log(e.message);
   }
@@ -241,8 +248,8 @@ const SELF_SETTLED = ["auth_refresh", "dynamic_tool_call"];
 /**
  * The run stopped at a prompt only a person answers: an approval, or a question it can't go on
  * past. T3 marks the other questions `blocking: false`: the run works past them, or (left after a
- * restart) T3 takes the answer as a message. It does not hold the machine: nobody should pay while
- * it waits. A question survives the sleep; an approval survives a warm resume, after a cold one T3
+ * restart) T3 takes the answer as a message. It holds the machine only as long as an unsettled
+ * thread does (AWAITING_REPLY_MS). A question survives the sleep; an approval survives a warm resume, after a cold one T3
  * expires it and the user sends a message to go on.
  */
 function waitsOnPerson(thread) {
@@ -366,7 +373,15 @@ async function checkWorking() {
       (running(t) && (!waiting.has(t) || besidePrompt.has(t.id))),
   );
   const subagents = live.filter((t) => t.lineage?.relationshipToParent === "subagent").length;
-  return { threads: live.length - subagents, subagents, waiting: waiting.size };
+  const recent = (iso) => iso != null && Date.now() - Date.parse(iso) < AWAITING_REPLY_MS;
+  const topLevel = (t) => here.has(t.id) && t.lineage?.relationshipToParent == null && t.delegatedFrom == null;
+  const awaitingReply = threads.filter(
+    (t) =>
+      topLevel(t) &&
+      t.settledAt == null &&
+      (waiting.has(t) ? recent(t.updatedAt) : !running(t) && recent(t.latestRunCompletedAt)),
+  ).length;
+  return { threads: live.length - subagents, subagents, waiting: waiting.size, awaitingReply };
 }
 
 /** The orchestration high-water marks T3 itself compares resume cursors against. */
@@ -560,6 +575,7 @@ async function tick() {
   if (keptAwake()) return touch("kept awake");
   if (cpuBusy()) return hold("cpu busy");
   if (dueSoon()) return hold("work due");
+  if (awaitingReply()) return hold("awaiting reply");
   // Can't tell: don't sleep, but it isn't activity either, so flaky checks can't hold it up forever.
   if (unknownBusy()) return;
 
@@ -607,6 +623,7 @@ function status() {
     workingSubagents: working.subagents,
     // Not busy, but a T3 restart would expire what they wait on.
     waitingThreads: working.waiting,
+    awaitingReplyThreads: working.awaitingReply,
     keepAwakeForever: keepAwakeUntil === Infinity,
     keepAwakeSecs: Number.isFinite(keepAwakeUntil) ? Math.max(0, Math.ceil((keepAwakeUntil - Date.now()) / 1000)) : 0,
     idleSecs: Math.floor((Date.now() - lastActivityAt) / 1000),
