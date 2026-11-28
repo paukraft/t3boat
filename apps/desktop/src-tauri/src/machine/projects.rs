@@ -88,7 +88,7 @@ impl MachineRuntime {
         }
         self.shared.changed();
         let result = async {
-            self.ensure_awake().await?;
+            self.ensure_awake(&format!("adding {}", project.title)).await?;
             self.kept_awake(self.clone_project(project, files)).await
         }
         .await;

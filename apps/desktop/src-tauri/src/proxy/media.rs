@@ -3,26 +3,46 @@
 //!
 //! Device and browser-preview streams are live pictures of what runs on the machine, so they
 //! exist only while it runs. T3 Code keeps retrying one while it is on screen, so they never wake
-//! the machine: a sleeping one answers 503. Any other socket (dictation, and whatever T3 adds) is
-//! opened by a person and wakes it.
+//! the machine: a sleeping one answers 503. So does any socket T3 adds, until it is known.
+//! Dictation is opened by a person and wakes it.
 
 use super::auth::TicketUse;
-use super::{client_authorized, query_param, query_without, relay, unauthorized, upstream, upstream_bearer, wake, Relay, M};
+use super::{
+    answer_head, client_authorized, query_param, query_without, relay, unauthorized, upstream, upstream_bearer, wake,
+    Relay, M,
+};
 use crate::machine::{MachineRuntime, Power};
+use axum::body::Body;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{CloseFrame as DownClose, Message as DownMsg, WebSocket, WebSocketUpgrade};
 use axum::extract::{Request, State};
 use axum::http::request::Parts;
-use axum::http::{Method, StatusCode};
+use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
+use tokio_tungstenite::tungstenite::http::Response as UpResponse;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame as UpClose;
 use tokio_tungstenite::tungstenite::{Error as UpError, Message as UpMsg};
 
 /// T3 Code acknowledges every preview frame with this: the one message a stream sends with
 /// nobody touching it.
 const FRAME_ACK: &str = r#"{"type":"ack"}"#;
+
+/// T3's mark on a tunnel refusal: the machine was reached and nothing listens on the port.
+const TUNNEL_PORT_REFUSED: HeaderName = HeaderName::from_static("x-t3-tunnel-port-refused");
+
+/// What a socket gets while the machine does not run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Asleep {
+    /// Opened by a person: the machine wakes for it.
+    Wakes,
+    /// 503, until the machine runs.
+    Unavailable,
+    /// The loopback tunnel: nothing listens on a sleeping machine, so it is refused as T3 refuses
+    /// a port nothing listens on.
+    PortRefused,
+}
 
 /// `/api/device-hub/*` and `/api/preview-stream/*`: plain requests (snapshots, MJPEG and
 /// event streams, uploads) and WebSockets alike.
@@ -33,7 +53,7 @@ pub async fn stream(
 ) -> Response {
     let (parts, body) = req.into_parts();
     if let Ok(upgrade) = upgrade {
-        return socket(m, upgrade, &parts, false).await;
+        return socket(m, upgrade, &parts, Asleep::Unavailable).await;
     }
     let Some(target) = authorized_target(&m, &parts) else {
         return unauthorized();
@@ -46,25 +66,55 @@ pub async fn stream(
     relay(&m, parts, body, route).await
 }
 
-/// Relays a WebSocket to the same path on the machine. `wakes`: a sleeping machine is woken for
-/// it; otherwise it answers 503.
-pub(super) async fn socket(m: Arc<MachineRuntime>, upgrade: WebSocketUpgrade, parts: &Parts, wakes: bool) -> Response {
+/// `/ws/voice`: dictation, opened by a person with a mic click.
+pub async fn voice(State(m): M, upgrade: WebSocketUpgrade, req: Request) -> Response {
+    socket(m, upgrade, &req.into_parts().0, Asleep::Wakes).await
+}
+
+/// `/api/preview/tunnel`: a TCP connection to a loopback port on the machine, for preview pages.
+/// T3 Code's desktop app also opens one on its own with every connection, retrying until it
+/// learns whether the machine shares this computer's loopback, so it never wakes the machine.
+pub async fn tunnel(State(m): M, upgrade: WebSocketUpgrade, req: Request) -> Response {
+    socket(m, upgrade, &req.into_parts().0, Asleep::PortRefused).await
+}
+
+/// Relays a WebSocket to the same path on the machine.
+pub(super) async fn socket(m: Arc<MachineRuntime>, upgrade: WebSocketUpgrade, parts: &Parts, asleep: Asleep) -> Response {
     let Some(target) = authorized_target(&m, parts) else {
         return unauthorized();
     };
-    if m.power() != Power::Running
-        && let Err(res) = wake(&m, wakes, &target).await
-    {
-        return res;
+    if m.power() != Power::Running {
+        if asleep == Asleep::PortRefused {
+            return port_refused();
+        }
+        if let Err(res) = wake(&m, asleep == Asleep::Wakes, &target).await {
+            return res;
+        }
     }
+    let tunnel = asleep == Asleep::PortRefused;
     match upstream::connect(&m.upstream_url(), &m.upstream_token(), &target).await {
-        Ok(up) => upgrade.on_upgrade(move |down| pump(m, down, up)),
-        // The machine's own refusal (no device hub, say) reaches T3 Code as it was.
+        Ok(up) => upgrade.on_upgrade(move |down| pump(m, down, up, tunnel)),
         Err(e) => match e.downcast_ref() {
-            Some(UpError::Http(res)) => res.status().into_response(),
+            Some(UpError::Http(res)) => machine_refusal(res),
             _ => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
         },
     }
+}
+
+fn port_refused() -> Response {
+    (StatusCode::FORBIDDEN, [(TUNNEL_PORT_REFUSED, HeaderValue::from_static("1"))], "The machine is asleep.")
+        .into_response()
+}
+
+/// The machine's own refusal (no device hub, a tunnel port nothing listens on) reaches T3 Code as
+/// it was, headers included: they say what it means.
+fn machine_refusal(res: &UpResponse<Option<Vec<u8>>>) -> Response {
+    let mut answer = answer_head(res.status(), res.headers())
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    // Its body, maybe read only in part, is not passed on.
+    answer.headers_mut().remove(header::CONTENT_LENGTH);
+    answer
 }
 
 /// Path and query on the machine, minus the proxy's ticket; `None` if the caller holds neither a
@@ -77,8 +127,9 @@ fn authorized_target(m: &MachineRuntime, parts: &Parts) -> Option<String> {
 }
 
 /// Passes frames both ways until either side ends, close code and reason included: T3 Code
-/// reads them to tell a closed tab from a stream to reopen.
-async fn pump(m: Arc<MachineRuntime>, down: WebSocket, up: upstream::Upstream) {
+/// reads them to tell a closed tab from a stream to reopen. `tunnel`: the preview tunnel, whose
+/// page may run on with nobody there: its data either way counts only while someone is around.
+async fn pump(m: Arc<MachineRuntime>, down: WebSocket, up: upstream::Upstream, tunnel: bool) {
     let (mut to_client, mut from_client) = down.split();
     let (mut to_machine, mut from_machine) = up.split();
     let upward = async {
@@ -90,7 +141,11 @@ async fn pump(m: Arc<MachineRuntime>, down: WebSocket, up: upstream::Upstream) {
                     // A click or a key in the stream is someone using the machine. Watching is
                     // not: an open preview must not keep it from sleeping.
                     if is_input(&msg) {
-                        m.user_action();
+                        if tunnel {
+                            m.tunnel_input();
+                        } else {
+                            m.user_action();
+                        }
                     }
                     machine_message(msg)
                 }
@@ -106,6 +161,10 @@ async fn pump(m: Arc<MachineRuntime>, down: WebSocket, up: upstream::Upstream) {
     let downward = async {
         // Pongs count: only a machine that stopped answering falls silent.
         while let Ok(Some(Ok(msg))) = tokio::time::timeout(upstream::SILENCE, from_machine.next()).await {
+            // What the page is sent keeps the machine awake too: server-sent events, hot reload.
+            if tunnel && matches!(msg, UpMsg::Text(_) | UpMsg::Binary(_)) {
+                m.tunnel_output();
+            }
             if let Some(msg) = client_message(msg) {
                 if to_client.send(msg).await.is_err() {
                     break;
@@ -148,4 +207,32 @@ fn client_message(msg: UpMsg) -> Option<DownMsg> {
         }
         UpMsg::Ping(_) | UpMsg::Pong(_) | UpMsg::Frame(_) => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_keeps_its_meaning() {
+        let res = UpResponse::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(TUNNEL_PORT_REFUSED, "1")
+            .header(header::CONTENT_LENGTH, "40")
+            .header(header::CONNECTION, "close")
+            .body(None)
+            .unwrap();
+        let answer = machine_refusal(&res);
+        assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+        assert_eq!(answer.headers()[TUNNEL_PORT_REFUSED], "1");
+        assert!(!answer.headers().contains_key(header::CONTENT_LENGTH));
+        assert!(!answer.headers().contains_key(header::CONNECTION));
+    }
+
+    #[test]
+    fn a_sleeping_machine_refuses_the_tunnel_as_t3_does() {
+        let answer = port_refused();
+        assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+        assert_eq!(answer.headers()[TUNNEL_PORT_REFUSED], "1");
+    }
 }

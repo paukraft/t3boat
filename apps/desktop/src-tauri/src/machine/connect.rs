@@ -17,7 +17,7 @@ impl MachineRuntime {
     /// Resolves once other devices can reach the machine through T3 Connect, after the user
     /// signed in to their T3 account in the browser.
     pub async fn turn_on_connect(&self) -> Result<()> {
-        self.ensure_awake().await?;
+        self.ensure_awake("turning on T3 Connect").await?;
         // `t3 up` restarts T3 to start the tunnel, which stops running agent turns and expires
         // the approvals they wait on.
         let s = self.watchdog_get("/status?fresh").await?;

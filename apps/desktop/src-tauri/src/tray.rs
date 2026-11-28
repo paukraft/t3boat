@@ -413,7 +413,7 @@ async fn add_project(ui: State<'_, Ui>, id: String, project_id: String) -> Res {
 
 #[tauri::command]
 async fn wake_machine(ui: State<'_, Ui>, id: String) -> Res {
-    ui.app()?.machine(&id).map_err(err)?.ensure_awake().await.map_err(err)
+    ui.app()?.machine(&id).map_err(err)?.ensure_awake("the Wake now button").await.map_err(err)
 }
 
 #[tauri::command]

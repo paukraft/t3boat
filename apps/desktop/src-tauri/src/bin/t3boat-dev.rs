@@ -60,7 +60,7 @@ async fn command(app: &Arc<App>, words: &[String]) -> anyhow::Result<()> {
         }
         Some("pair") => app.pair(&*app.machine(&arg(1))?)?,
         Some("upgrade") => app.machine(&arg(1))?.upgrade_if_needed().await?,
-        Some("wake") => app.machine(&arg(1))?.ensure_awake().await?,
+        Some("wake") => app.machine(&arg(1))?.ensure_awake("t3boat-dev").await?,
         Some("sleep") => app.machine(&arg(1))?.sleep_now().await?,
         Some("connect") => app.machine(&arg(1))?.turn_on_connect().await?,
         Some("keep") => app.machine(&arg(1))?.keep_awake(words.get(2).map(|m| m.parse()).transpose()?).await?,

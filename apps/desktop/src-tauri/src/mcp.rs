@@ -369,7 +369,7 @@ async fn run(app: &Arc<App>, call: Call) -> Result<String> {
         }
         Call::WakeMachine { machine } => {
             let m = app.machine(&machine)?;
-            m.ensure_awake().await?;
+            m.ensure_awake("an agent's wake_machine").await?;
             format!("{} is awake.", m.record().name)
         }
         Call::SleepMachine { machine } => {
