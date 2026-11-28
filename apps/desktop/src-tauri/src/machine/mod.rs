@@ -30,7 +30,8 @@ use tokio::sync::{mpsc, watch};
 const WATCHDOG_POLL: Duration = Duration::from_secs(5);
 const BOAT_POLL: Duration = Duration::from_secs(60);
 const OVERDUE_STOP_RETRY: Duration = Duration::from_secs(120);
-/// A running machine on older scripts takes this app's in place, retried this often.
+/// A running machine on older scripts takes this app's in place, retried this often; one on
+/// another T3 version than the desktop app's downloads that ahead of its next wake as often.
 const UPGRADE_RETRY: Duration = Duration::from_secs(10 * 60);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(20);
 /// Preview tunnel traffic counts as use only this long after a person's last other action: a
@@ -456,12 +457,17 @@ impl MachineRuntime {
         self.set_power(Power::Starting);
         let mut resumed = false;
         let mut restored = false;
+        let mut desktop_version = None;
         loop {
             match self.refresh_power().await? {
                 Power::Running => break,
                 Power::Stopped => {
                     tracing::info!("resuming {id}");
                     self.set_power(Power::Starting);
+                    // Read while it resumes, and on every resume: T3 Code updates itself while
+                    // this app runs.
+                    let t3 = self.shared.t3.clone();
+                    desktop_version = Some(tokio::spawn(async move { t3.version().await }));
                     let record = self.record();
                     if self.shared.boat.resume(&record.sandbox_id, &record.size).await? == Resume::DataExpired {
                         self.restore().await?;
@@ -485,30 +491,67 @@ impl MachineRuntime {
         }
         self.drop_capture();
         self.set_power(Power::Starting);
+        // An answer here is ready already; none, and Boat may not have restored the ports.
         if self.fetch_descriptor().await.is_none() {
             self.rehost().await?;
+            self.wait_ready(started).await?;
         }
-        self.wait_ready(started).await?;
-        if resumed {
-            // T3 serves now and may have started work on its own, or an agent waits on the user;
-            // restarting it would kill that. A restored machine booted fresh from its snapshot:
-            // nothing to kill, and the upgrade drops the snapshot's stale chats.
-            if !restored && self.watchdog_get("/status?fresh").await.is_ok_and(|s| s.busy || s.waiting_threads > 0) {
-                tracing::info!("{id} is busy: T3 upgrade deferred to the next wake");
-            } else if let Err(e) = self.upgrade_if_needed().await {
-                tracing::warn!("upgrading {id}: {e:#}");
-            }
+        if let Some(desktop_version) = desktop_version
+            && let Err(e) = self.upgrade_on_resume(desktop_version, restored).await
+        {
+            tracing::warn!("upgrading {id}: {e:#}");
+            // Provisioning may have restarted T3 on the new version before it failed.
+            self.fetch_descriptor().await;
         }
         // Before Running is published: T3 Code reconnects then, and must find the messages
-        // accepted while asleep ahead of anything it sends next.
-        self.on_ready().await;
-        self.set_power(Power::Running);
+        // accepted while asleep ahead of anything it sends next. The wake just read the
+        // descriptor.
+        let refresh_session = async {
+            if let Err(e) = self.refresh_session().await {
+                tracing::warn!("refreshing {id}'s session: {e:#}");
+            }
+        };
+        tokio::join!(self.flush_deferred_commands(), refresh_session, self.send_activity(resumed));
+        // Unless the watchdog, already stopping it, refused the activity: requests wait for the
+        // stop and wake it again.
+        if !self.is_stopping() {
+            self.set_power(Power::Running);
+        }
         tracing::info!("{id} awake after {:?}", started.elapsed());
-        self.send_activity(resumed).await;
         Ok(())
     }
 
-    /// T3 answers after a wake: sends what waited for it and refreshes the session.
+    /// A resumed machine moves to the desktop app's T3 version before T3 Code reconnects to it,
+    /// which takes a restart of T3: quick when the run loop downloaded it while the machine ran
+    /// (`stage_upgrade`), a download inside the wake otherwise. New scripts alone don't hold the
+    /// wake up: the run loop applies them live.
+    async fn upgrade_on_resume(&self, desktop_version: tokio::task::JoinHandle<Result<String>>, restored: bool) -> Result<()> {
+        let version = desktop_version.await.context("reading T3 Code's version")??;
+        if version == self.record().t3_version {
+            return Ok(());
+        }
+        // T3 serves now and may have started work on its own, or an agent waits on the user;
+        // restarting it would kill that. A restored machine booted fresh from its snapshot:
+        // nothing to kill, and the upgrade drops the snapshot's stale chats.
+        if !restored && self.watchdog_get("/status?fresh").await.is_ok_and(|s| s.busy || s.waiting_threads > 0) {
+            tracing::info!("{} is busy: T3 upgrade deferred to the next wake", self.id());
+            return Ok(());
+        }
+        self.upgrade(Some(version)).await
+    }
+
+    /// Downloads the desktop app's T3 version onto the running machine for its next wake. T3 is
+    /// neither switched nor restarted.
+    async fn stage_upgrade(&self) -> Result<()> {
+        let version = self.shared.t3.version().await?;
+        if version != self.record().t3_version {
+            provision::stage(&self.shared.boat, &self.sandbox_id(), &version).await?;
+        }
+        Ok(())
+    }
+
+    /// T3 answered after a failed wake: sends what waited for it and refreshes the descriptor and
+    /// session.
     async fn on_ready(&self) {
         self.flush_deferred_commands().await;
         if let Err(e) = self.prime().await {
@@ -519,6 +562,10 @@ impl MachineRuntime {
     /// Fills what the proxy must answer before the machine can sleep: descriptor and session.
     pub async fn prime(&self) -> Result<()> {
         self.fetch_descriptor().await.ok_or_else(|| anyhow!("T3 on the machine did not answer"))?;
+        self.refresh_session().await
+    }
+
+    async fn refresh_session(&self) -> Result<()> {
         let session = self
             .shared
             .http
@@ -982,6 +1029,7 @@ impl MachineRuntime {
         // Told the user its own sleep is broken: once per run of this app.
         let mut overdue_stop_told = false;
         let mut last_upgrade: Option<Instant> = None;
+        let mut last_stage: Option<Instant> = None;
         let mut watchdog_failures = 0u32;
         let mut was_busy = false;
         let mut was_running = false;
@@ -1072,12 +1120,14 @@ impl MachineRuntime {
                             tokio::spawn(async move { this.on_ready().await });
                         }
                         let sleep_broken = s.sleep_broken;
-                        // Otherwise only a resume upgrades it, and an older watchdog whose own stop
+                        // New scripts alone reach a machine only here: a resume upgrades only for a
+                        // new T3 version (scripts with it), and an older watchdog whose own stop
                         // always fails never sleeps. Scripts only: T3 runs on under whatever works
                         // there. Not during a save, which restarting the watchdog would kill, nor
                         // while T3 can't be checked: a restarted one takes that for T3 starting,
                         // not maybe mid-turn.
-                        let upgrade = s.phase == WatchdogPhase::Active
+                        let active = s.phase == WatchdogPhase::Active;
+                        let upgrade = active
                             && !s.saving
                             && !s.agents_unknown
                             && self.record().provision_revision != provision::revision();
@@ -1108,6 +1158,16 @@ impl MachineRuntime {
                             if let Err(e) = self.upgrade(None).await {
                                 tracing::warn!("upgrading {}: {e:#}", self.id());
                             }
+                        }
+                        if active && last_stage.is_none_or(|t| t.elapsed() >= UPGRADE_RETRY) {
+                            last_stage = Some(Instant::now());
+                            // Spawned: a download outlasts a drain's 45 s grace for the ack.
+                            let this = self.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = this.stage_upgrade().await {
+                                    tracing::warn!("downloading T3 Code onto {}: {e:#}", this.id());
+                                }
+                            });
                         }
                     }
                     Err(_) => watchdog_failures += 1,
@@ -1151,5 +1211,163 @@ mod tests {
         assert!(!attended(None));
         assert!(attended(minutes(119)));
         assert!(!attended(minutes(121)));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod wake_tests {
+    use super::*;
+    use crate::boat::Boat;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A Boat CLI with one sandbox, stopped until resumed. Logs each call; keeps the last script
+    /// run on the machine. Provisioning there answers as `provision.sh` does.
+    const BOAT: &str = r#"#!/bin/sh
+d=$(dirname "$0"); shift
+echo "$1" >> "$d/log"
+case "$1" in
+  info) echo "{\"sandbox\":{\"id\":\"bx_a\",\"state\":\"$(cat "$d/state")\"}}" ;;
+  resume) echo running > "$d/state"; echo '{}' ;;
+  scp) ;;
+  exec) printf '%s' "$8" > "$d/script"; printf '%s\n' '{"exitCode":0,"stdout":"{\"environmentId\":\"env\"}\n"}' ;;
+  *) exit 1 ;;
+esac
+"#;
+
+    /// The machine's T3 server and watchdog on one port: requests as `METHOD /path?query`.
+    async fn serve_machine(busy: bool) -> (String, Arc<Mutex<Vec<String>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(format!("{} {}", req.method(), req.uri()));
+                axum::Json(match req.uri().path() {
+                    "/.well-known/t3/environment" => json!({ "environmentId": "env" }),
+                    "/api/auth/session" => json!({}),
+                    _ => json!({
+                        "phase": "active", "busy": busy, "workingThreads": 0, "workingSubagents": 0,
+                        "cpuBusy": false, "agentsUnknown": false, "keepAwakeSecs": 0,
+                        "keepAwakeForever": false, "idleSecs": 0, "sleepAfterSecs": 180,
+                    }),
+                })
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (url, requests)
+    }
+
+    struct Woken {
+        machine: Arc<MachineRuntime>,
+        dir: PathBuf,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Drop for Woken {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl Woken {
+        fn boat_calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.join("log")).unwrap().lines().map(str::to_owned).collect()
+        }
+        fn requested(&self, request: &str) -> bool {
+            self.requests.lock().unwrap().iter().any(|r| r == request)
+        }
+    }
+
+    /// Wakes a sleeping machine on T3 `on` and scripts `revision`, with T3 Code on `desktop`.
+    async fn wake(test: &str, on: &str, revision: &str, desktop: &str, busy: bool) -> Woken {
+        let dir = std::env::temp_dir().join(format!("t3boat-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("machine")).unwrap();
+        for (name, script) in [("boat", BOAT.to_owned()), ("t3", format!("#!/bin/sh\necho 't3 v{desktop}'\n"))] {
+            std::fs::write(dir.join(name), script).unwrap();
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.join("state"), "stopped").unwrap();
+        let (url, requests) = serve_machine(busy).await;
+        let shared = Arc::new(Shared {
+            boat: Boat::at(dir.join("boat")),
+            t3: T3Desktop::at(dir.join("t3")),
+            settings: RwLock::new(Settings::default()),
+            events: mpsc::unbounded_channel().0,
+            http: reqwest::Client::new(),
+            saving: Mutex::default(),
+        });
+        let record = Machine {
+            id: "bx_a".into(),
+            sandbox_id: "bx_a".into(),
+            name: "dev".into(),
+            size: "small".into(),
+            upstream_url: url.clone(),
+            upstream_token: "up".into(),
+            watchdog_url: url,
+            watchdog_secret: "secret".into(),
+            local_port: 0,
+            t3_version: on.into(),
+            provision_revision: revision.into(),
+            environment_id: "env".into(),
+            client_tokens: Vec::new(),
+            link_tokens: Vec::new(),
+            created_at: 0,
+            next_due_at: None,
+            connect: false,
+            saved_stop: None,
+        };
+        let machine = Arc::new(MachineRuntime::new(shared, record, dir.join("machine")));
+        machine.ensure_awake("a test").await.unwrap();
+        assert_eq!(machine.power(), Power::Running);
+        Woken { machine, dir, requests }
+    }
+
+    /// New scripts alone don't hold a wake up: the run loop applies them live. Nor does the
+    /// watchdog's slow fresh check run when there is nothing to upgrade.
+    #[tokio::test]
+    async fn wake_leaves_new_scripts_to_the_run_loop() {
+        let w = wake("wake-scripts", "1.0", "older", "1.0", false).await;
+        assert_eq!(w.boat_calls(), ["info", "resume"]);
+        assert!(!w.requested("GET /status?fresh"));
+        assert!(w.requested("POST /activity"));
+        assert_eq!(w.machine.record().provision_revision, "older");
+    }
+
+    /// A new T3 version is installed before the machine counts as running, scripts with it.
+    #[tokio::test]
+    async fn wake_moves_to_the_desktop_version() {
+        let w = wake("wake-version", "1.0", "older", "2.0", false).await;
+        assert_eq!(w.boat_calls(), ["info", "resume", "scp", "exec"]);
+        assert!(w.requested("GET /status?fresh"));
+        let record = w.machine.record();
+        assert_eq!((record.t3_version.as_str(), record.provision_revision), ("2.0", provision::revision()));
+    }
+
+    /// Restarting T3 would kill what works or waits there: the new version waits for a later wake.
+    #[tokio::test]
+    async fn wake_defers_the_upgrade_while_busy() {
+        let w = wake("wake-busy", "1.0", "older", "2.0", true).await;
+        assert_eq!(w.boat_calls(), ["info", "resume"]);
+        assert_eq!(w.machine.record().t3_version, "1.0");
+    }
+
+    /// The desktop app's version downloads onto a running machine on another one, beside it: the
+    /// `t3` it runs stays.
+    #[tokio::test]
+    async fn stages_the_desktop_version_beside_the_running_one() {
+        let w = wake("stage", "1.0", "older", "2.0", true).await;
+        w.machine.stage_upgrade().await.unwrap();
+        let script = std::fs::read_to_string(w.dir.join("script")).unwrap();
+        assert!(script.contains("T3CODE_VERSION=2.0 T3CODE_INSTALL_BIN_DIR=\"$HOME/.t3boat/staged\" sh"), "{script}");
+        assert!(script.starts_with("set -o pipefail;"), "{script}");
+
+        // Nothing to download once the machine runs T3 Code's version.
+        std::fs::write(w.dir.join("t3"), "#!/bin/sh\necho 't3 v1.0'\n").unwrap();
+        let calls = w.boat_calls().len();
+        w.machine.stage_upgrade().await.unwrap();
+        assert_eq!(w.boat_calls().len(), calls);
     }
 }

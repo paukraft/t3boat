@@ -29,6 +29,9 @@ if [ "$live" = 0 ] && [ "$("$t3" --version 2>/dev/null || true)" != "t3 v$versio
   fi
   restart_t3=1
 fi
+# What was downloaded ahead is installed now, or passed over: its launcher would keep T3 from
+# pruning it.
+[ "$live" = 1 ] || rm -f "$boat_dir/staged/t3"
 settings="$HOME/.t3/userdata/settings.json"
 before="$(cat "$settings" 2>/dev/null || true)"
 node -e '
