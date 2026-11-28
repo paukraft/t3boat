@@ -93,10 +93,6 @@
   color: var(--tag-dim-fg);
   letter-spacing: 0.06em;
 }
-.tag-error {
-  background: var(--danger);
-  color: #fff;
-}
 .tag.is-active {
   z-index: 1;
   background: var(--ink);

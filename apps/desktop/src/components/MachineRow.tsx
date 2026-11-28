@@ -34,6 +34,7 @@ export function MachineRow({
   const primary = primaryAction(m);
   const detail = useDetail(m);
   const extra = menuActions(m, sizes);
+  const signedOut = m.agents.filter((a) => !a.signedIn).map((a) => a.name);
   const [armed, arm] = useArmed(); // two-step confirm for the primary "Remove"
   // "Add a project…" picks from T3 Code's projects in the details view
   const menuAction = (a: MenuItem) => ("kind" in a ? onOpen?.(true) : onAction(a));
@@ -95,14 +96,22 @@ export function MachineRow({
           onKeep={onDismissDeleteError}
         />
       ) : null}
-      {m.id && m.signedOut.length ? (
+      {m.wakeError ? (
+        <div className="row-note is-danger" role="alert">
+          <span className="row-note-text">Couldn't wake: {m.wakeError}</span>
+          <button className="btn btn-link" disabled={!!pending} onClick={() => onAction(ACTIONS.retry)}>
+            {ACTIONS.retry.label}
+          </button>
+        </div>
+      ) : null}
+      {m.id && signedOut.length ? (
         <div className="row-note">
           <span className="row-note-text">
-            <AgentNames names={m.signedOut} /> {m.signedOut.length === 1 ? "needs" : "need"} a sign-in
+            <AgentNames names={signedOut} /> {signedOut.length === 1 ? "needs" : "need"} a sign-in
           </span>
-          {m.signedOut.map((agent) => (
+          {signedOut.map((agent) => (
             <button key={agent} className="btn btn-link" disabled={!!pending} onClick={() => onAction(signInTo(agent))}>
-              {m.signedOut.length > 1 ? <AgentName name={agent} /> : "Sign in"}
+              {signedOut.length > 1 ? <AgentName name={agent} /> : "Sign in"}
             </button>
           ))}
         </div>

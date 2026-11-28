@@ -225,7 +225,12 @@ function Ready({ state, toast }: { state: UiState; toast: (t: string, tone?: "er
       ) : view === "settings" ? (
         <SettingsView
           state={state}
-          onSave={(settings) => call("update_settings", { settings }).catch((e) => toast(errorText(e)))}
+          onSave={(settings) =>
+            call("update_settings", { settings }).catch((e) => {
+              toast(errorText(e));
+              throw e;
+            })
+          }
           onAddMcp={addMcp}
           onQuit={() => call("quit_app", undefined).catch((e) => toast(errorText(e)))}
           onBack={back}

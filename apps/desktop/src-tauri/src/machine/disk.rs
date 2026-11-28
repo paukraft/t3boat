@@ -64,8 +64,9 @@ impl MachineRuntime {
                     self.shared.notify(
                         format!("{}'s backup snapshot isn't saving", record.name),
                         format!(
-                            "{e:#}. t3boat keeps trying. If Boat deletes the sleeping machine's disk before a save succeeds, \
-                             it is restored from its last saved snapshot, losing later work, or cannot be restored if it never had one."
+                            "{}. t3boat keeps trying. If Boat deletes the sleeping machine's disk before a save succeeds, \
+                             it is restored from its last saved snapshot, losing later work, or cannot be restored if it never had one.",
+                            crate::boat::plain(&e).trim_end_matches('.')
                         ),
                     );
                 }

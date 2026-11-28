@@ -33,7 +33,7 @@ pub struct Provisioned {
 }
 
 /// Machine sizes, as Boat sells them.
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SizeInfo {
     pub id: &'static str,

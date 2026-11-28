@@ -425,7 +425,7 @@ async fn wake(m: &MachineRuntime, allowed: bool, why: &str) -> Result<(), Respon
     if !allowed {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
-    m.ensure_awake(why)
+    m.wake_for_request(why)
         .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response())
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, crate::boat::plain(&e)).into_response())
 }

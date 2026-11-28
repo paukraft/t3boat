@@ -18,7 +18,7 @@ pub enum Agent {
 }
 
 impl Agent {
-    /// By the provider's display name, as `signedOut` lists it.
+    /// By the provider's display name, as `agents` lists it.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "Claude" => Some(Self::Claude),

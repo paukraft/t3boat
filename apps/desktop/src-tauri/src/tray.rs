@@ -18,7 +18,7 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_notification::NotificationExt;
 
 const PANEL: &str = "panel";
-const COSTS_EVERY: Duration = Duration::from_secs(300);
+const ACCOUNT_EVERY: Duration = Duration::from_secs(300);
 /// macOS tints the black template icon to its menu bar; other trays show it as is, and their
 /// panels are often dark, so they get the app icon.
 const TRAY_ICON: &[u8] = if cfg!(target_os = "macos") {
@@ -37,10 +37,12 @@ struct Ui {
     windowed: AtomicBool,
     /// One `init` at a time: the startup check and "Check again" must not both build an App.
     init_lock: tokio::sync::Mutex<()>,
+    /// The state the panel was last sent.
+    sent: Mutex<Option<UiState>>,
 }
 
 /// Whether each coding agent CLI has t3boat's MCP server; `None`: that CLI is not installed.
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Default, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct McpStatus {
     claude_code: Option<bool>,
@@ -69,7 +71,7 @@ struct SetupState {
     sign_in_code: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct Account {
     identifier: Option<String>,
@@ -77,7 +79,7 @@ struct Account {
 }
 
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct UiState {
     setup: Setup,
@@ -113,10 +115,25 @@ impl Ui {
     }
 }
 
+/// Sends the panel the state if it changed. A hidden panel gets it as it opens.
 fn emit_state(handle: &AppHandle) {
-    let state = handle.state::<Ui>().state();
+    let shown = handle.get_webview_window(PANEL).is_some_and(|p| p.is_visible().unwrap_or(false));
+    send_state(handle, shown);
+}
+
+fn send_state(handle: &AppHandle, to_panel: bool) {
+    let ui = handle.state::<Ui>();
+    let state = {
+        // Built under the lock: a concurrent call can't send an older state last.
+        let mut sent = ui.sent.lock().unwrap();
+        let state = ui.state();
+        if to_panel && sent.as_ref() != Some(&state) {
+            let _ = handle.emit("state", &state);
+            *sent = Some(state.clone());
+        }
+        state
+    };
     update_tray(handle, &state);
-    let _ = handle.emit("state", state);
 }
 
 fn update_tray(handle: &AppHandle, state: &UiState) {
@@ -192,13 +209,12 @@ async fn events(handle: AppHandle, app: Arc<App>, mut rx: tokio::sync::mpsc::Unb
     }
 }
 
-/// Costs and the account change slowly; refreshed on a timer.
+/// The account changes slowly; refreshed on a timer.
 async fn background(handle: AppHandle, app: Arc<App>) {
     loop {
-        app.refresh_costs().await;
         refresh_account(&handle, &app.shared.boat).await;
         emit_state(&handle);
-        tokio::time::sleep(COSTS_EVERY).await;
+        tokio::time::sleep(ACCOUNT_EVERY).await;
     }
 }
 
@@ -238,7 +254,10 @@ fn open_panel(handle: &AppHandle, anchor: Option<Anchor>) {
         place_under_tray(handle, &panel, anchor);
     }
     show_focused(&panel);
-    emit_state(handle);
+    send_state(handle, true);
+    if let Ok(app) = handle.state::<Ui>().app() {
+        app.want_fresh_costs();
+    }
     let handle = handle.clone();
     tauri::async_runtime::spawn(async move { refresh_mcp(&handle).await });
 }
@@ -385,7 +404,8 @@ fn panel_position(handle: &AppHandle, panel: &tauri::WebviewWindow, a: &Anchor) 
 type Res<T = ()> = Result<T, String>;
 
 fn err(e: anyhow::Error) -> String {
-    format!("{e:#}")
+    tracing::info!("command failed: {e:#}");
+    crate::boat::plain(&e)
 }
 
 #[tauri::command]

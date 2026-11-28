@@ -7,7 +7,6 @@ const TAGS: Record<MachineState, string> = {
   asleep: "zzz",
   waking: "waking",
   creating: "building",
-  error: "error",
   missing: "gone",
   unknown: "…",
 };
@@ -35,7 +34,7 @@ export type Action = {
   | { cmd: "resize_machine"; size: string }
   /** null = until stopped (auto sleep off), 0 ends it */
   | { cmd: "keep_awake"; minutes: number | null }
-  /** the agent's name as `signedOut` lists it */
+  /** the agent's name as `agents` lists it */
   | { cmd: "sign_in_agent"; agent: string }
   /** discard: delete even while work runs on it */
   | { cmd: "delete_machine"; discard: boolean }
@@ -57,7 +56,7 @@ export const ACTIONS = {
   pair: { cmd: "open_machine", label: "Add to T3 Code", busy: "Sending…", solid: true },
   repair: { cmd: "pair_machine", label: "Add to T3 Code again", busy: "Sending…" },
   wake: { cmd: "wake_machine", label: "Wake now", busy: "Waking…" },
-  retry: { cmd: "wake_machine", label: "Try waking", busy: "Waking…" },
+  retry: { cmd: "wake_machine", label: "Try again", busy: "Waking…" },
   sleep: { cmd: "sleep_machine", label: "Sleep now", busy: "Sleeping…" },
   connect: { cmd: "turn_on_connect", label: "Turn on", busy: "Approve in browser…" },
   remove: { cmd: "delete_machine", label: "Remove", busy: "Removing…", discard: true },
@@ -72,8 +71,6 @@ export function primaryAction(m: MachineView): Action | null {
     case "idle":
     case "asleep": // wakes by itself when used in T3 Code; opening it lives in the details view
       return m.paired ? null : ACTIONS.pair;
-    case "error":
-      return ACTIONS.retry;
     case "missing":
       return ACTIONS.remove;
     default:
@@ -164,7 +161,7 @@ export const hasRepo = (m: MachineView, repoKey: string) => m.projects.some((p) 
 
 /** Up and added to T3 Code, but nothing to work on yet: the last step of setting it up. */
 export const needsProject = (m: MachineView) =>
-  m.paired && !m.projects.length && !["creating", "missing", "error"].includes(m.state);
+  m.paired && !m.projects.length && !["creating", "missing"].includes(m.state);
 
 export const shortDate = (unixSecs: number) =>
   new Date(unixSecs * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });

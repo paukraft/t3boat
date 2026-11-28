@@ -26,7 +26,6 @@ export interface Palette {
   star: Color[];
   cloud: Color[]; // lit top → shaded underside
   foam: Color;
-  flag: Color;
   reflection: Color;
   sailReflection: Color;
   boat: BoatColors;
@@ -48,7 +47,6 @@ const light: Palette = {
   star: [],
   cloud: ["#fefefe", "#f1f3f9", "#e0e3f2", "#c2c9e6"].map(rgb),
   foam: rgb("#fefefe"),
-  flag: rgb("#e0452f"),
   reflection: rgb("#1d2a6b"),
   sailReflection: rgb("#c2c9e6"),
   boat: {
@@ -84,7 +82,6 @@ const dark: Palette = {
   star: ["#e0e3f2", "#929fd3", "#495eb7"].map(rgb),
   cloud: [],
   foam: rgb("#c2c9e6"),
-  flag: rgb("#ff6a4d"),
   reflection: rgb("#0b1029"),
   sailReflection: rgb("#495eb7"),
   boat: {

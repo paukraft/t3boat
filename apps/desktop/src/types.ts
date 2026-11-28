@@ -9,7 +9,6 @@ export type MachineState =
   | "asleep"
   | "waking"
   | "creating"
-  | "error"
   | "missing"
   | "unknown";
 
@@ -19,13 +18,21 @@ export interface MachineView {
   size: string;
   state: MachineState;
   detail: string;
+  wakeError: string | null; // why the last wake failed, in plain words, until one succeeds or T3 answers anyway; not while it wakes again
   countdown: Countdown | null; // set while `detail` counts down
   paired: boolean;
-  signedOut: string[];
+  agents: AgentLogin[]; // its agents whose sign-in is known
+  t3Version: string; // "" while unknown
   projects: MachineProject[]; // its T3 projects as last seen (never wakes it), then those being added
   keepAwakeUntil: number | null; // when a "keep awake" runs out (unix ms); null when off or until stopped
   keepAwakeForever: boolean; // kept awake until someone stops it: no auto sleep
   waiting: boolean; // an agent there waits on the user: a resize waits for the next sleep
+  connect: boolean; // T3 Connect is on: the user's other devices reach it with their T3 account
+}
+
+export interface AgentLogin {
+  name: string;
+  signedIn: boolean;
 }
 
 export interface MachineProject {
@@ -69,7 +76,7 @@ export interface UiState {
   signInCode: string | null;
   account: { identifier: string | null; plan: string | null } | null;
   machines: MachineView[];
-  costs: { today: number; month: number; startsToday: number; startsLimit: number };
+  costs: { today: number; month: number; startsToday: number; startsLimit: number | null }; // null: no limit
   settings: Settings;
   sizes: Size[];
   /** null = that CLI isn't installed */
@@ -81,11 +88,7 @@ export interface MachineDetails {
   costToday: number;
   costMonth: number;
   awakeSecsToday: number;
-  agents: { name: string; signedIn: boolean }[];
-  t3Version: string;
   createdAt: number; // unix secs
-  /** T3 Connect is on: the user's other devices reach it with their T3 account */
-  connect: boolean;
 }
 
 export type SetupAction = "installBoat" | "signInBoat" | "installT3" | "recheck";

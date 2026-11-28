@@ -25,10 +25,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 
 const WATCHDOG_POLL: Duration = Duration::from_secs(5);
-const BOAT_POLL: Duration = Duration::from_secs(60);
 const OVERDUE_STOP_RETRY: Duration = Duration::from_secs(120);
 /// A running machine on older scripts takes this app's in place, retried this often; one on
 /// another T3 version than the desktop app's downloads that ahead of its next wake as often.
@@ -56,6 +55,8 @@ const DUE_WAKE_RETRY: Duration = Duration::from_secs(5 * 60);
 const LINK_CHECK: Duration = Duration::from_secs(10 * 60);
 /// A running trial machine's lifetime is pushed back once this close to its end.
 const TRIAL_RENEW_LEAD: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
+/// About as often as Boat is polled: retried until an answer shows the lifetime moved.
+const TRIAL_RENEW_RETRY: Duration = Duration::from_secs(60);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Power {
@@ -156,6 +157,8 @@ pub struct Shared {
     pub http: reqwest::Client,
     /// Sandboxes whose snapshot is being saved: a delete leaves each to its save.
     pub saving: Mutex<HashSet<String>>,
+    /// A machine started or stopped: costs and starts moved.
+    pub costs_stale: Notify,
 }
 
 impl Shared {
@@ -184,15 +187,20 @@ pub struct MachineRuntime {
     watchdog: Mutex<Option<WatchdogStatus>>,
     /// One wake at a time; a delete takes it too, so no restore swaps the sandbox under it.
     pub(crate) waking: tokio::sync::Mutex<()>,
+    /// Held through a wake's attempt proper, not by the others taking `waking` (`recover`, a
+    /// delete). A lock, so a wake dropped mid-way lets go of it too.
+    attempt: tokio::sync::Mutex<()>,
     /// One capture at a time: "sleep now" and the background poll can see the same drain.
     capturing: tokio::sync::Mutex<()>,
+    /// One send of the queued messages at a time: each is sent and, if refused, reported once.
+    flushing: tokio::sync::Mutex<()>,
     last_heartbeat: Mutex<Option<Instant>>,
     /// A person's last use, preview tunnel traffic aside.
     last_user_action: Mutex<Option<Instant>>,
     /// When the watchdog was seen stopping the machine; cleared once Boat reports it stopped or
     /// the watchdog is active again.
     stop_seen: Mutex<Option<Instant>>,
-    /// The last failed wake: its message and when.
+    /// The last failed wake: why, in plain words, and when.
     wake_failure: Mutex<Option<(String, Instant)>>,
     /// Saving the snapshot failing, until a save succeeds.
     save_failure: Mutex<Option<disk::SaveFailure>>,
@@ -216,7 +224,9 @@ impl MachineRuntime {
             lifetime_ends: Mutex::new(None),
             watchdog: Mutex::new(None),
             waking: tokio::sync::Mutex::new(()),
+            attempt: tokio::sync::Mutex::new(()),
             capturing: tokio::sync::Mutex::new(()),
+            flushing: tokio::sync::Mutex::new(()),
             last_heartbeat: Mutex::new(None),
             last_user_action: Mutex::new(None),
             stop_seen: Mutex::new(None),
@@ -284,6 +294,9 @@ impl MachineRuntime {
             if p != Power::Running {
                 *self.watchdog.lock().unwrap() = None;
             }
+            if matches!(p, Power::Running | Power::Stopped) {
+                self.shared.costs_stale.notify_one();
+            }
             self.shared.changed();
         }
     }
@@ -295,8 +308,14 @@ impl MachineRuntime {
     /// Long enough for any stop to finish; a stop still pending after this failed.
     const STOP_SETTLE: Duration = Duration::from_secs(120);
 
-    pub fn last_error(&self) -> Option<String> {
+    /// Why the last wake failed, until one succeeds or T3 answers anyway.
+    pub fn wake_error(&self) -> Option<String> {
         self.wake_failure.lock().unwrap().as_ref().map(|(e, _)| e.clone())
+    }
+
+    /// A wake attempt runs, and publishes its own outcome.
+    pub fn is_waking(&self) -> bool {
+        self.attempt.try_lock().is_err()
     }
 
     /// The machine is about to freeze or frozen: user actions must wait for it and wake it again.
@@ -322,42 +341,42 @@ impl MachineRuntime {
         }
     }
 
+    /// Asks Boat about this machine alone. Only the app's shared poll tells it gone.
     pub async fn refresh_power(&self) -> Result<Power> {
         let id = self.sandbox_id();
-        match self.shared.boat.info(&id).await {
-            Ok(sb) => {
-                // A restore swapped the sandbox meanwhile: this answer is about the old one.
-                if self.sandbox_id() != id {
-                    return Ok(self.power());
-                }
-                *self.stopped_at.lock().unwrap() = sb.stopped_at;
-                *self.lifetime_ends.lock().unwrap() = sb.trial_deadline();
-                let mut p = Power::from_sandbox(&sb);
-                if p == Power::Stopped {
-                    *self.stop_seen.lock().unwrap() = None;
-                } else if p == Power::Running && self.stop_pending() {
-                    // Boat lags behind the watchdog by a few seconds.
-                    p = Power::Stopping;
-                } else if p == Power::Running && self.waking.try_lock().is_err() {
-                    // A wake is waiting for T3 to answer; it publishes Running once it does.
-                    return Ok(p);
-                }
-                self.set_power(p);
-                Ok(p)
-            }
-            Err(e) => {
-                let gone = self.shared.boat.confirmed_gone(&id).await;
-                if self.sandbox_id() != id {
-                    // Restored meanwhile, and the old sandbox deleted.
-                    return Ok(self.power());
-                }
-                if gone {
-                    self.set_power(Power::Missing);
-                    return Ok(Power::Missing);
-                }
-                Err(e)
-            }
+        let sandbox = self.shared.boat.info(&id).await?;
+        Ok(self.observe(&id, Some(&sandbox)))
+    }
+
+    /// What Boat said of sandbox `id`; `None`: gone, Boat having no such sandbox.
+    pub fn observe(&self, id: &str, sandbox: Option<&Sandbox>) -> Power {
+        // A restore swapped the sandbox meanwhile: this answer is about the old one.
+        if self.sandbox_id() != id {
+            return self.power();
         }
+        let Some(sb) = sandbox else {
+            self.set_power(Power::Missing);
+            return self.power();
+        };
+        *self.stopped_at.lock().unwrap() = sb.stopped_at;
+        *self.lifetime_ends.lock().unwrap() = sb.trial_deadline();
+        let mut p = Power::from_sandbox(sb);
+        if p == Power::Stopped {
+            *self.stop_seen.lock().unwrap() = None;
+        } else if p == Power::Running && self.stop_pending() {
+            // Boat lags behind the watchdog by a few seconds.
+            p = Power::Stopping;
+        } else if p == Power::Running && self.is_waking() {
+            // A wake is waiting for T3 to answer; it publishes Running once it does.
+            return p;
+        }
+        self.set_power(p);
+        p
+    }
+
+    /// When Boat last stopped it.
+    pub fn stopped_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        *self.stopped_at.lock().unwrap()
     }
 
     /// Waits out transitional states, so callers see Running or Stopped (or Missing). A wake
@@ -404,48 +423,73 @@ impl MachineRuntime {
     }
 
     /// Brings the machine up if needed and returns once its T3 server answers and will stay up.
-    /// Concurrent callers share one wake. `why`: what needs it, logged when it wakes, as every wake
-    /// must be explainable.
+    /// Concurrent callers share one wake, failed or not. Tried even right after a failed one:
+    /// someone asked. `why`: what needs it, logged when it wakes, as every wake must be
+    /// explainable.
     pub async fn ensure_awake(&self, why: &str) -> Result<()> {
+        self.wake(why, false).await
+    }
+
+    /// `ensure_awake` for what T3 Code sends on its own: right after a failed wake each of its
+    /// requests fails fast instead of retrying `boat resume`.
+    pub async fn wake_for_request(&self, why: &str) -> Result<()> {
+        self.wake(why, true).await
+    }
+
+    async fn wake(&self, why: &str, cooldown: bool) -> Result<()> {
+        let asked = Instant::now();
         let _guard = self.waking.lock().await;
         // Checked under the lock: a delete holding it retires the machine.
         if self.power() == Power::Missing {
             bail!("the sandbox no longer exists on Boat");
         }
-        if let Some((e, at)) = self.wake_failure.lock().unwrap().clone() {
-            if at.elapsed() < WAKE_COOLDOWN {
-                return Err(anyhow!(e));
-            }
+        // A wake that failed while this caller waited for it is this caller's too.
+        if let Some((e, at)) = self.wake_failure.lock().unwrap().clone()
+            && (at >= asked || cooldown && at.elapsed() < WAKE_COOLDOWN)
+        {
+            return Err(anyhow!(e));
         }
-        if self.power() == Power::Running && !self.is_stopping() && self.fetch_descriptor().await.is_some() {
+        // After a failed wake the whole wake runs again, even if T3 answers by now: it finishes
+        // what that one left undone.
+        if self.wake_error().is_none()
+            && self.power() == Power::Running
+            && !self.is_stopping()
+            && self.fetch_descriptor().await.is_some()
+        {
             if self.watchdog_status().is_some_and(|w| matches!(w.phase, WatchdogPhase::Saving | WatchdogPhase::Draining)) {
                 // Someone needs it after all: call the sleep off before it stops.
                 self.send_activity(false).await;
             }
             // Too late if the watchdog is already stopping: wake_locked waits for it and resumes.
             if !self.is_stopping() {
-                if self.wake_failure.lock().unwrap().take().is_some() {
-                    self.shared.changed();
-                }
                 // A message accepted while another caller's wake was finishing.
                 self.flush_deferred_commands().await;
                 return Ok(());
             }
         }
-        tracing::info!("waking {} for {why}", self.id());
-        let result = self.wake_locked().await;
+        let result = {
+            let _attempt = self.attempt.lock().await;
+            tracing::info!("waking {} for {why}", self.id());
+            // The UI drops the last failure now, even if power is already Starting.
+            self.shared.changed();
+            self.wake_locked().await
+        };
         let was_failing = self.wake_failure.lock().unwrap().is_some();
         match &result {
             Ok(()) => *self.wake_failure.lock().unwrap() = None,
             Err(e) => {
-                let msg = format!("{e:#}");
+                tracing::warn!("waking {}: {e:#}", self.id());
+                let msg = crate::boat::plain(e);
                 if !was_failing {
                     self.shared.notify(format!("{} could not wake", self.record().name), msg.clone());
                 }
                 *self.wake_failure.lock().unwrap() = Some((msg, Instant::now()));
+                // Power lands where Boat has it, Running too: `recover` finishes the wake if T3
+                // answers later.
                 let _ = self.refresh_power().await;
             }
         }
+        // Past the attempt lock: the UI no longer sees it waking.
         self.shared.changed();
         result
     }
@@ -476,7 +520,6 @@ impl MachineRuntime {
                     resumed = true;
                     break;
                 }
-                Power::Missing => bail!("the sandbox no longer exists on Boat"),
                 _ => {}
             }
             if started.elapsed() > READY_TIMEOUT {
@@ -503,15 +546,8 @@ impl MachineRuntime {
             // Provisioning may have restarted T3 on the new version before it failed.
             self.fetch_descriptor().await;
         }
-        // Before Running is published: T3 Code reconnects then, and must find the messages
-        // accepted while asleep ahead of anything it sends next. The wake just read the
-        // descriptor.
-        let refresh_session = async {
-            if let Err(e) = self.refresh_session().await {
-                tracing::warn!("refreshing {id}'s session: {e:#}");
-            }
-        };
-        tokio::join!(self.flush_deferred_commands(), refresh_session, self.send_activity(resumed));
+        // With the activity that keeps it up meanwhile.
+        tokio::join!(self.on_ready(), self.send_activity(resumed));
         // Unless the watchdog, already stopping it, refused the activity: requests wait for the
         // stop and wake it again.
         if !self.is_stopping() {
@@ -550,12 +586,34 @@ impl MachineRuntime {
         Ok(())
     }
 
-    /// T3 answered after a failed wake: sends what waited for it and refreshes the descriptor and
-    /// session.
-    async fn on_ready(&self) {
-        self.flush_deferred_commands().await;
-        if let Err(e) = self.prime().await {
-            tracing::warn!("refreshing {}'s session: {e:#}", self.id());
+    /// T3 answers after a wake, its descriptor just read: sends what waited for it and refreshes
+    /// the session, both at once. Before Running is published: T3 Code reconnects then, and must
+    /// find the messages accepted while asleep ahead of anything it sends next. True once none
+    /// wait; T3 Code's sockets send any left before they connect.
+    async fn on_ready(&self) -> bool {
+        let refresh_session = async {
+            if let Err(e) = self.refresh_session().await {
+                tracing::warn!("refreshing {}'s session: {e:#}", self.id());
+            }
+        };
+        tokio::join!(self.flush_deferred_commands(), refresh_session).0
+    }
+
+    /// A failed wake came up after all: made ready once T3 answers, as a wake would. Not while
+    /// a wake runs, which does that itself. T3's own answer, not the watchdog's word, which calls
+    /// T3 unknown only once it answered before, and for 30 min at most. Running is published
+    /// already: T3 Code's sockets send what waited themselves before they connect.
+    async fn recover(&self) {
+        let Ok(_guard) = self.waking.try_lock() else {
+            return;
+        };
+        if self.wake_error().is_none() || self.power() != Power::Running || self.fetch_descriptor().await.is_none() {
+            return;
+        }
+        // Still failed while messages wait, or if Boat stopped it meanwhile.
+        if self.on_ready().await && self.power() == Power::Running {
+            *self.wake_failure.lock().unwrap() = None;
+            self.shared.changed();
         }
     }
 
@@ -649,11 +707,13 @@ impl MachineRuntime {
         self.wait_ready(Instant::now()).await
     }
 
-    async fn flush_deferred_commands(&self) {
-        // Left queued until delivered: the run loop retries a failed send.
+    /// Sends the messages accepted while it slept. False: some are still queued, left until
+    /// delivered; the run loop retries a failed send.
+    pub(crate) async fn flush_deferred_commands(&self) -> bool {
+        let _guard = self.flushing.lock().await;
         let commands = self.cache.lock().unwrap().deferred_commands.clone();
         if commands.is_empty() {
-            return;
+            return true;
         }
         let requests = commands
             .iter()
@@ -675,10 +735,12 @@ impl MachineRuntime {
             // Resent on the next try; the server dedupes them by commandId.
             Err(e) => {
                 tracing::warn!("sending deferred commands: {e:#}");
-                return;
+                return false;
             }
         }
         self.save_cache();
+        // More may have been accepted meanwhile.
+        self.cache.lock().unwrap().deferred_commands.is_empty()
     }
 
     /// Someone used the machine.
@@ -1019,7 +1081,6 @@ impl MachineRuntime {
                 tracing::warn!("priming {}: {e:#}", self.id());
             }
         }
-        let mut last_boat_poll: Option<Instant> = None;
         let mut last_keep_alive: Option<Instant> = None;
         let mut last_due_wake: Option<Instant> = None;
         let mut last_link_check: Option<Instant> = None;
@@ -1030,29 +1091,35 @@ impl MachineRuntime {
         let mut overdue_stop_told = false;
         let mut last_upgrade: Option<Instant> = None;
         let mut last_stage: Option<Instant> = None;
+        let mut last_trial_renew: Option<Instant> = None;
         let mut watchdog_failures = 0u32;
         let mut was_busy = false;
         let mut was_running = false;
         loop {
-            let transitioning = matches!(self.power(), Power::Stopping | Power::Starting | Power::Unknown);
-            if transitioning || last_boat_poll.is_none_or(|t| t.elapsed() >= BOAT_POLL) || watchdog_failures >= 2 {
-                last_boat_poll = Some(Instant::now());
-                let watchdog_known = watchdog_failures == 0;
+            let watchdog_known = watchdog_failures == 0;
+            // The app's shared poll follows it otherwise. Not mid-wake: the wake asks itself.
+            let awaited = matches!(self.power(), Power::Stopping | Power::Starting) && !self.is_waking();
+            if awaited || watchdog_failures >= 2 {
                 watchdog_failures = 0;
-                match self.refresh_power().await {
-                    // Boat would stop it at its end, mid-turn or not; the sandbox's own key can't
-                    // extend it, so this app does. Not once it is going to sleep; an unreachable
-                    // watchdog counts as unknown. Retried each poll until it moves.
-                    Ok(Power::Running)
-                        if self.lifetime_ends.lock().unwrap().is_some_and(|t| t - chrono::Utc::now() <= TRIAL_RENEW_LEAD)
-                            && (!watchdog_known || self.watchdog_status().is_none_or(|w| w.phase == WatchdogPhase::Active)) =>
-                    {
-                        if let Err(e) = self.shared.boat.extend_trial(&self.sandbox_id()).await {
-                            tracing::warn!("boat extend {}: {e:#}", self.id());
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("boat info {}: {e:#}", self.id()),
+                if let Err(e) = self.refresh_power().await {
+                    tracing::warn!("boat info {}: {e:#}", self.id());
+                }
+            }
+            // Rechecked under the wake lock.
+            if self.wake_error().is_some() {
+                self.recover().await;
+            }
+            // Boat would stop it at its end, mid-turn or not; the sandbox's own key can't extend
+            // it, so this app does. Not once it is going to sleep; an unreachable watchdog counts
+            // as unknown.
+            if self.power() == Power::Running
+                && self.lifetime_ends.lock().unwrap().is_some_and(|t| t - chrono::Utc::now() <= TRIAL_RENEW_LEAD)
+                && (!watchdog_known || self.watchdog_status().is_none_or(|w| w.phase == WatchdogPhase::Active))
+                && last_trial_renew.is_none_or(|t| t.elapsed() >= TRIAL_RENEW_RETRY)
+            {
+                last_trial_renew = Some(Instant::now());
+                if let Err(e) = self.shared.boat.extend_trial(&self.sandbox_id()).await {
+                    tracing::warn!("boat extend {}: {e:#}", self.id());
                 }
             }
             match self.power() {
@@ -1071,14 +1138,16 @@ impl MachineRuntime {
                 }
             }
             let due = self.scheduled_wake().is_some_and(|due| chrono::Utc::now() >= due - DUE_LEAD);
-            if (due || self.has_queued_wake())
-                && last_due_wake.is_none_or(|t| t.elapsed() >= DUE_WAKE_RETRY)
-            {
+            if due && last_due_wake.is_none_or(|t| t.elapsed() >= DUE_WAKE_RETRY) {
                 last_due_wake = Some(Instant::now());
-                let why = if due { "work due" } else { "a message sent while asleep" };
-                if let Err(e) = self.ensure_awake(why).await {
-                    tracing::warn!("waking {} for {why}: {e:#}", self.id());
+                if let Err(e) = self.ensure_awake("work due").await {
+                    tracing::warn!("waking {} for work due: {e:#}", self.id());
                 }
+            } else if self.has_queued_wake() && last_due_wake.is_none_or(|t| t.elapsed() >= DUE_WAKE_RETRY) {
+                // Paced like work due: Boat may refuse for long (start limit, billing), and this
+                // runs with T3 Code closed too. As a request, it also waits out the cooldown.
+                last_due_wake = Some(Instant::now());
+                let _ = self.wake_for_request("a message sent while asleep").await;
             }
             if let Some((sandbox, stop)) = self.begin_save() {
                 let this = self.clone();
@@ -1113,12 +1182,6 @@ impl MachineRuntime {
                             tokio::spawn(async move { this.refresh_projects().await });
                         }
                         was_busy = s.busy;
-                        if !s.agents_unknown && self.wake_failure.lock().unwrap().take().is_some() {
-                            // A failed wake came up after all: T3 answers.
-                            self.shared.changed();
-                            let this = self.clone();
-                            tokio::spawn(async move { this.on_ready().await });
-                        }
                         let sleep_broken = s.sleep_broken;
                         // New scripts alone reach a machine only here: a resume upgrades only for a
                         // new T3 version (scripts with it), and an older watchdog whose own stop
@@ -1147,7 +1210,7 @@ impl MachineRuntime {
                                 Err(e) => {
                                     tracing::warn!("stopping {}: {e:#}", self.id());
                                     if !std::mem::replace(&mut overdue_stop_failed, true) {
-                                        self.shared.notify(format!("{} won't go to sleep", self.record().name), format!("{e:#}"));
+                                        self.shared.notify(format!("{} won't go to sleep", self.record().name), crate::boat::plain(&e));
                                     }
                                 }
                             }
@@ -1186,8 +1249,9 @@ impl MachineRuntime {
         (self.power() == Power::Stopped && due > stopped_at).then_some(due)
     }
 
-    /// A message T3 Code was told is sent, still queued on a sleeping machine: its wake failed
-    /// or never ran.
+    /// A message T3 Code was told is sent, still queued on a sleeping machine: its wake failed or
+    /// never ran. One Boat runs but T3 doesn't answer on is recover()'s, not another whole wake
+    /// every cooldown.
     fn has_queued_wake(&self) -> bool {
         self.power() == Power::Stopped
             && self.cache.lock().unwrap().deferred_commands.iter().any(|c| {
@@ -1298,6 +1362,7 @@ esac
             events: mpsc::unbounded_channel().0,
             http: reqwest::Client::new(),
             saving: Mutex::default(),
+            costs_stale: Notify::new(),
         });
         let record = Machine {
             id: "bx_a".into(),
