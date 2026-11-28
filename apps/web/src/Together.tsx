@@ -85,7 +85,8 @@ export function Together() {
     if (!mock) return;
     // the visitor's machine: the first one, as the popover starts with none
     mock.call("get_state", undefined).then((s) => setMachine(s.machines[0]));
-    return mock.subscribe((s) => setMachine(s.machines[0]));
+    const unsubscribe = mock.subscribe((s) => setMachine(s.machines[0]));
+    return () => void unsubscribe.then((stop) => stop());
   }, [mock]);
 
   const now = phaseOf(machine, picker, stage);

@@ -60,7 +60,8 @@ export function Launch() {
   useEffect(() => {
     if (!mock) return;
     mock.call("get_state", undefined).then((s) => setMachines(s.machines));
-    return mock.subscribe((s) => setMachines(s.machines));
+    const unsubscribe = mock.subscribe((s) => setMachines(s.machines));
+    return () => void unsubscribe.then((stop) => stop());
   }, [mock]);
 
   const pick = (p: Partial<Picker>) => setPicker((now) => ({ ...now, ...p }));
